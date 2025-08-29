@@ -1,0 +1,7 @@
+
+## Installation
+
+requirements:
+
+* pycsep
+* *geopandas
