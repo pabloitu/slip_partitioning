@@ -1,49 +1,62 @@
 # build_anss_mechanisms.py
 # Requirements: requests, numpy
 # Output: an NDK-like mechanisms CSV matching your GCMT file fields.
+import pandas
+from obspy.clients.fdsn import Client
+import numpy as np
 
 import csv
 import math
 import requests
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
+#
 
-import numpy as np
+USGS_BASE = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 
-USGS_EVENT_DETAIL_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
-
-IN_CSV  = "global_2/anss.csv"                 # <-- your ANSS CSV (as shown)
-OUT_CSV = "anss_mechanisms.csv"               # <-- output like GCMT mechanisms
-
-
-# ----------------------- helpers -----------------------
-def _sf(x) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _best_mag(mag: str, magtype: str) -> Optional[float]:
+def axes_from_sdr(strike: float, dip: float, rake: float):
     """
-    Prefer Mw-type mags from the ANSS CSV; else just use the given magnitude.
+    (strike, dip, rake) -> dict with T/N/P axes (azimuth, plunge) in GCMT convention.
+    Azimuth: CW from North; Plunge: downward 0..90.
     """
-    if mag is None or mag == "":
-        return None
-    mag = float(mag)
-    if magtype:
-        mt = magtype.strip().lower()
-        if mt.startswith("mw"):  # mww, mwc, mwb, mwr, ...
-            return mag
-    return mag
+    st, di, ra = map(np.radians, [strike, dip, rake])
+    # plane normal n and slip s in NED
+    nN = -np.sin(di) * np.sin(st)
+    nE =  np.sin(di) * np.cos(st)
+    nD = -np.cos(di)
+    sN =  np.cos(ra) * np.cos(st) + np.sin(ra) * np.cos(di) * np.sin(st)
+    sE =  np.cos(ra) * np.sin(st) - np.sin(ra) * np.cos(di) * np.cos(st)
+    sD =  np.sin(ra) * np.sin(di)
+    n = np.array([nN, nE, nD]); n /= np.linalg.norm(n)
+    s = np.array([sN, sE, sD]); s /= np.linalg.norm(s)
+    M = np.outer(s, n) + np.outer(n, s)  # DC tensor (orientation only)
+    # eigenvectors: columns correspond to P (min), N (mid), T (max)
+    w, V = np.linalg.eigh(M)
+    idx = np.argsort(w)
+    V = V[:, idx]
+    P, N, T = V[:, 0], V[:, 1], V[:, 2]
 
+    def vec_to_az_pl(v):
+        v = v / np.linalg.norm(v)
+        if v[2] < 0:  # force downward plunge
+            v = -v
+        az = (math.degrees(math.atan2(v[1], v[0])) + 360.0) % 360.0
+        pl = math.degrees(math.asin(max(-1.0, min(1.0, v[2]))))
+        return az, pl
 
-def _pick_product(prod_list: List[Dict], prefer_source: Optional[str] = "us") -> Optional[Dict]:
+    T_az, T_pl = vec_to_az_pl(T)
+    N_az, N_pl = vec_to_az_pl(N)
+    P_az, P_pl = vec_to_az_pl(P)
+    return {
+        "T_plunge": T_pl, "T_azimuth": T_az,
+        "N_plunge": N_pl, "N_azimuth": N_az,
+        "P_plunge": P_pl, "P_azimuth": P_az,
+    }
+
+def pick_product(prod_list, prefer_source="us"):
     """
-    Choose a product from a products list:
-    - prefer the requested source network (e.g., 'us'),
-    - else pick the one flagged 'preferred',
-    - else first in list.
+    Choose a product dict from a list of GeoJSON products.
+    Priority: source==prefer_source -> preferred==True -> first item.
     """
     if not prod_list:
         return None
@@ -56,44 +69,78 @@ def _pick_product(prod_list: List[Dict], prefer_source: Optional[str] = "us") ->
             return p
     return prod_list[0]
 
-
-def _get_products(event_id: str) -> Dict[str, List[Dict]]:
+def fetch_products_from_comcat(event_id: str):
     """
-    Fetch ComCat detail for a single event id; return the 'products' dict.
-    (We ask for includesuperseded=true to widen the set, but we still choose
-    a single 'preferred' one per product type.)
+    GeoJSON detail call for one event id; returns the 'products' dict.
     """
-    params = {
-        "format": "geojson",
-        "eventid": event_id,
-        "includesuperseded": "true",
-    }
-    r = requests.get(USGS_EVENT_DETAIL_URL, params=params, timeout=30)
+    params = {"format": "geojson", "eventid": event_id, "includesuperseded": "true"}
+    r = requests.get(USGS_BASE, params=params, timeout=30)
     r.raise_for_status()
     js = r.json()
     feats = js.get("features") or []
     if not feats:
-        raise ValueError(f"No features for eventid={event_id}")
-    props = feats[0].get("properties") or {}
-    return props.get("products") or {}
+        return {}
+    return (feats[0].get("properties") or {}).get("products") or {}
 
+def extract_mech_from_products(products: dict):
+    """
+    Pull planes (from 'focal-mechanism' or 'moment-tensor') and axes (from 'moment-tensor').
+    Returns dict with strike1,dip1,rake1, strike2,dip2,rake2, and optionally T/N/P.
+    """
+    fm = pick_product(products.get("focal-mechanism", []), prefer_source="us")
+    mt = pick_product(products.get("moment-tensor", []),   prefer_source="us")
+    fm_p = fm.get("properties") if fm else {}
+    mt_p = mt.get("properties") if mt else {}
 
-# ---- compute T/N/P from SDR if needed (pure DC) ----
-def _sdr_to_axes(strike: float, dip: float, rake: float) -> Tuple[Tuple[float,float], Tuple[float,float], Tuple[float,float]]:
+    # planes: prefer FM; fallback to MT props if present
+    s1 = fm_p.get("nodal-plane-1-strike") or mt_p.get("nodal-plane-1-strike")
+    d1 = fm_p.get("nodal-plane-1-dip")    or mt_p.get("nodal-plane-1-dip")
+    r1 = (fm_p.get("nodal-plane-1-rake") or fm_p.get("nodal-plane-1-slip") or
+          mt_p.get("nodal-plane-1-rake") or mt_p.get("nodal-plane-1-slip"))
+    s2 = fm_p.get("nodal-plane-2-strike") or mt_p.get("nodal-plane-2-strike")
+    d2 = fm_p.get("nodal-plane-2-dip")    or mt_p.get("nodal-plane-2-dip")
+    r2 = (fm_p.get("nodal-plane-2-rake") or fm_p.get("nodal-plane-2-slip") or
+          mt_p.get("nodal-plane-2-rake") or mt_p.get("nodal-plane-2-slip"))
+
+    try:
+        s1, d1, r1 = float(s1), float(d1), float(r1)
+        s2, d2, r2 = float(s2), float(d2), float(r2)
+    except (TypeError, ValueError):
+        return None  # no numeric planes in products
+
+    # axes (if available on MT)
+    T_pl = mt_p.get("t-axis-plunge");  T_az = mt_p.get("t-axis-azimuth")
+    N_pl = mt_p.get("n-axis-plunge");  N_az = mt_p.get("n-axis-azimuth")
+    P_pl = mt_p.get("p-axis-plunge");  P_az = mt_p.get("p-axis-azimuth")
+    axes = {}
+    try:
+        if None not in (T_pl, T_az, N_pl, N_az, P_pl, P_az):
+            axes = {
+                "T_plunge": float(T_pl), "T_azimuth": float(T_az),
+                "N_plunge": float(N_pl), "N_azimuth": float(N_az),
+                "P_plunge": float(P_pl), "P_azimuth": float(P_az),
+            }
+        else:
+            axes = axes_from_sdr(s1, d1, r1)
+    except Exception:
+        axes = axes_from_sdr(s1, d1, r1)
+
+    return {
+        "strike1": s1, "dip1": d1, "rake1": r1,
+        "strike2": s2, "dip2": d2, "rake2": r2,
+        **axes,
+        "source": (fm.get("source") if fm and fm.get("source") else
+                   (mt.get("source") if mt else None) or "usgs")
+    }
+
+def _sdr_to_axes(strike: float, dip: float, rake: float):
     """
-    Convert (strike,dip,rake) to T/N/P axes (azimuth, plunge) in degrees.
-    We build a DC moment tensor from SDR (in NED), then eigendecompose.
+    Convert (strike, dip, rake) -> (T,N,P) axes as (azimuth, plunge) in degrees,
+    using a unit double-couple in NED (North,East,Down). Conventions as GCMT.
     """
-    # Convert to radians
     st, di, ra = map(np.radians, [strike, dip, rake])
 
-    # Fault normal (upper hemisphere) and slip vector in NED
-    # Following Aki & Richards conventions:
-    # strike clockwise from North; dip 0..90; rake -180..180 (positive down-dip)
-    # Unit vectors:
-    #   n (plane normal), s (slip within plane)
-    # Build direction cosines
-    # Reference: standard focal mech conversions
+    # Fault normal (upper hemisphere) and slip, NED coordinates
     nN = -np.sin(di) * np.sin(st)
     nE =  np.sin(di) * np.cos(st)
     nD = -np.cos(di)
@@ -104,168 +151,175 @@ def _sdr_to_axes(strike: float, dip: float, rake: float) -> Tuple[Tuple[float,fl
     n = np.array([nN, nE, nD]); n /= np.linalg.norm(n)
     s = np.array([sN, sE, sD]); s /= np.linalg.norm(s)
 
-    # DC moment tensor (unit moment is fine for axes)
-    # M = (s ⊗ n + n ⊗ s) (symmetric)
+    # DC tensor (orientation only)
     M = np.outer(s, n) + np.outer(n, s)
 
-    # Eigen-decomp (ascending)
+    # Principal axes (ascending eigenvalues): P (min), N (mid), T (max)
     w, V = np.linalg.eigh(M)
     idx = np.argsort(w)
-    V = V[:, idx]  # columns: P (min), N (mid), T (max)
-
-    P = V[:, 0]; N = V[:, 1]; T = V[:, 2]
+    V = V[:, idx]
+    P, N, T = V[:, 0], V[:, 1], V[:, 2]
 
     def vec_to_az_pl(v):
         v = v / np.linalg.norm(v)
-        # ensure downward plunge (D >= 0)
+        # make plunge downward (Down >= 0)
         if v[2] < 0:
             v = -v
         Nn, Ee, Dd = v
-        az = (np.degrees(np.arctan2(Ee, Nn)) + 360.0) % 360.0
-        pl = np.degrees(np.arcsin(np.clip(Dd, -1.0, 1.0)))
+        az = (math.degrees(math.atan2(Ee, Nn)) + 360.0) % 360.0
+        pl = math.degrees(math.asin(max(-1.0, min(1.0, Dd))))
         return az, pl
 
     T_az, T_pl = vec_to_az_pl(T)
     N_az, N_pl = vec_to_az_pl(N)
     P_az, P_pl = vec_to_az_pl(P)
-
     return (T_az, T_pl), (N_az, N_pl), (P_az, P_pl)
 
-
-def extract_mechanism_for_event(row: Dict[str, str]) -> Optional[Dict[str, object]]:
+def tnp_from_obspy_fm(fm):
     """
-    Given one CSV row from your ANSS file, query ComCat and assemble:
-      id,time_iso,lon,lat,depth_km,Mw,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,source
+    Given an ObsPy FocalMechanism, return a dict matching your GCMT fields:
+    T_plunge, T_azimuth, N_plunge, N_azimuth, P_plunge, P_azimuth.
+
+    Priority:
+      1) use fm.principal_axes if present
+      2) else compute from nodal_plane_1 (strike,dip,rake)
+      3) else (optionally) compute from fm.moment_tensor.tensor if you have it
     """
-    eid = row.get("id")
-    if not eid:
-        return None
+    # 1) Direct from principal_axes (if provided in QuakeML)
+    pax = getattr(fm, "principal_axes", None)
+    if pax and pax.t_axis and pax.n_axis and pax.p_axis:
+        T_pl = float(pax.t_axis.plunge); T_az = float(pax.t_axis.azimuth) % 360.0
+        N_pl = float(pax.n_axis.plunge); N_az = float(pax.n_axis.azimuth) % 360.0
+        P_pl = float(pax.p_axis.plunge); P_az = float(pax.p_axis.azimuth) % 360.0
+        return {
+            "T_plunge": T_pl, "T_azimuth": T_az,
+            "N_plunge": N_pl, "N_azimuth": N_az,
+            "P_plunge": P_pl, "P_azimuth": P_az,
+        }
 
-    products = _get_products(eid)
-
-    # FOCAL-MECHANISM: nodal planes (most direct)
-    fm = _pick_product(products.get("focal-mechanism", []), prefer_source="us")
-    fm_props = fm.get("properties") if fm else {}
-
-    s1 = _sf(fm_props.get("nodal-plane-1-strike"))
-    d1 = _sf(fm_props.get("nodal-plane-1-dip"))
-    r1 = _sf(fm_props.get("nodal-plane-1-rake"))
-    s2 = _sf(fm_props.get("nodal-plane-2-strike"))
-    d2 = _sf(fm_props.get("nodal-plane-2-dip"))
-    r2 = _sf(fm_props.get("nodal-plane-2-rake"))
-
-    # MOMENT-TENSOR: T/N/P and sometimes nodal planes too
-    mt = _pick_product(products.get("moment-tensor", []), prefer_source="us")
-    mt_props = mt.get("properties") if mt else {}
-
-    t_pl = _sf(mt_props.get("t-axis-plunge"));  t_az = _sf(mt_props.get("t-axis-azimuth"))
-    n_pl = _sf(mt_props.get("n-axis-plunge"));  n_az = _sf(mt_props.get("n-axis-azimuth"))
-    p_pl = _sf(mt_props.get("p-axis-plunge"));  p_az = _sf(mt_props.get("p-axis-azimuth"))
-
-    # If nodal planes missing but MT has them (sometimes included) use those:
-    if s1 is None:
-        s1 = _sf(mt_props.get("nodal-plane-1-strike"))
-        d1 = _sf(mt_props.get("nodal-plane-1-dip"))
-        # some feeds use 'slip' instead of 'rake'
-        r1 = _sf(mt_props.get("nodal-plane-1-rake") or mt_props.get("nodal-plane-1-slip"))
-    if s2 is None:
-        s2 = _sf(mt_props.get("nodal-plane-2-strike"))
-        d2 = _sf(mt_props.get("nodal-plane-2-dip"))
-        r2 = _sf(mt_props.get("nodal-plane-2-rake") or mt_props.get("nodal-plane-2-slip"))
-
-    # If axes missing but we have SDR, compute axes
-    if (t_pl is None or t_az is None or n_pl is None or n_az is None or p_pl is None or p_az is None) and \
-       (s1 is not None and d1 is not None and r1 is not None):
-        (t_az, t_pl), (n_az, n_pl), (p_az, p_pl) = _sdr_to_axes(s1, d1, r1)
-
-    # Time/loc: prefer MT-derived centroid if available; else use CSV hypocenter
-    time_iso = row.get("time")  # CSV already ISO (e.g., 2025-08-22T20:42:25.416Z)
-    lon = _sf(mt_props.get("derived-longitude")) or _sf(row.get("longitude"))
-    lat = _sf(mt_props.get("derived-latitude"))  or _sf(row.get("latitude"))
-    dep = _sf(mt_props.get("derived-depth"))     or _sf(row.get("depth"))
-    # derived-eventtime is ISO 8601 per docs
-    det = mt_props.get("derived-eventtime")
-    if det:
-        time_iso = det
-
-    # Magnitude rule
-    Mw = _best_mag(row.get("mag"), row.get("magType"))
-
-    # If still missing any essential pieces, skip
-    if not ( (s1 is not None and d1 is not None and r1 is not None) and
-             (s2 is not None and d2 is not None and r2 is not None) and
-             (t_pl is not None and t_az is not None and
-              n_pl is not None and n_az is not None and
-              p_pl is not None and p_az is not None) ):
-        # We require both planes and axes to match your GCMT-style output
-        return None
-
-    source = None
-    if fm and fm.get("source"):
-        source = fm["source"]
-    elif mt and mt.get("source"):
-        source = mt["source"]
-    else:
-        source = row.get("net")  # fallback
-
-    return dict(
-        id=eid,
-        time_iso=time_iso.replace("Z", "+00:00") if time_iso else None,
-        longitude=lon, latitude=lat, depth_km=dep, Mw=Mw,
-        strike1=s1, dip1=d1, rake1=r1, strike2=s2, dip2=d2, rake2=r2,
-        T_plunge=t_pl, T_azimuth=t_az,
-        N_plunge=n_pl, N_azimuth=n_az,
-        P_plunge=p_pl, P_azimuth=p_az,
-        source=source,
-    )
+    # 2) Compute from a nodal plane (use plane 1; plane 2 yields the same axes)
+    npanes = getattr(fm, "nodal_planes", None)
+    if npanes and npanes.nodal_plane_1:
+        s = float(npanes.nodal_plane_1.strike)
+        d = float(npanes.nodal_plane_1.dip)
+        r = float(npanes.nodal_plane_1.rake)
+        (T_az, T_pl), (N_az, N_pl), (P_az, P_pl) = _sdr_to_axes(s, d, r)
+        return {
+            "T_plunge": T_pl, "T_azimuth": T_az,
+            "N_plunge": N_pl, "N_azimuth": N_az,
+            "P_plunge": P_pl, "P_azimuth": P_az,
+        }
 
 
-# ----------------------- run over CSV -----------------------
-def read_anss_csv(path: str) -> List[Dict[str, str]]:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            rows.append(r)
-    return rows
+if __name__ == '__main__':
+
+    input_file = 'global_2/anss.csv'
+    output_file_prefix = 'global_2/anss_mechanisms'
+
+    client = Client("USGS")
+    client.help()
 
 
-def write_mech_csv(rows: List[Dict[str, object]], out_path: str):
+    hypo_cat = pandas.read_csv(input_file)
+
     fieldnames = [
-        "id","time_iso","longitude","latitude","depth_km","Mw",
-        "strike1","dip1","rake1","strike2","dip2","rake2",
-        "T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth","source"
+        "id", "time_iso", "longitude", "latitude", "depth", "mag", "mag_type",
+        "strike1", "dip1", "rake1", "strike2", "dip2", "rake2",
+        "T_plunge", "T_azimuth", "N_plunge", "N_azimuth", "P_plunge", "P_azimuth", "source"
     ]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
+
+    catalog = []
+    for i, event in list(hypo_cat.iterrows())[1688:1689]:
+        focal_catalog = client.get_events(eventid=event.id)
+        print(f'Processing event {i}')
+        print(focal_catalog)
+
+        if focal_catalog[0].focal_mechanisms:
+            pref_fm = None
+
+            for fm in focal_catalog[0].focal_mechanisms:
+                if fm.nodal_planes is not None:
+                    pref_fm = focal_catalog[0].focal_mechanisms[0]
+                    break
+            if pref_fm.nodal_planes is None:
+                print(f'Event {i},  id: {event.id} has no focal nodal planes')
+                continue
+
+            np1 = [pref_fm.nodal_planes.nodal_plane_1.strike,
+                   pref_fm.nodal_planes.nodal_plane_1.dip,
+                   pref_fm.nodal_planes.nodal_plane_1.rake]
+            np2 = [pref_fm.nodal_planes.nodal_plane_1.strike,
+                   pref_fm.nodal_planes.nodal_plane_1.dip,
+                   pref_fm.nodal_planes.nodal_plane_1.rake]
+
+            principal_axes = tnp_from_obspy_fm(pref_fm)
+
+            parsed_event = [event.id,
+                            event.time,
+                            event.longitude, event.latitude,
+                            event.depth,
+                            event.mag,
+                            event.magType,
+                            *np1, *np2,
+                            principal_axes['T_plunge'],
+                            principal_axes['T_azimuth'],
+                            principal_axes['N_plunge'],
+                            principal_axes['N_azimuth'],
+                            principal_axes['P_plunge'],
+                            principal_axes['P_azimuth'],
+                            "usgs"
+                            ]
+            catalog.append(parsed_event)
 
 
-if __name__ == "__main__":
-    in_rows = read_anss_csv(IN_CSV)
-    out_rows = []
-    misses = []
-    for i, r in enumerate(in_rows, 1):
-        eid = r.get("id")
-        try:
-            mech = extract_mechanism_for_event(r)
+
+        elif True:
+            # >>> Fallback: query USGS API GeoJSON detail and extract planes/axes
+            try:
+                products = fetch_products_from_comcat(str(event.id))
+                print(products)
+                mech = extract_mech_from_products(products)
+            except Exception as e:
+                mech = None
+                print(f"  USGS API fallback failed for {event.id}: {e}")
+
             if mech:
-                out_rows.append(mech)
-            else:
-                misses.append(eid)
-        except Exception as e:
-            misses.append(f"{eid} ({e})")
-        if i % 25 == 0:
-            print(f"Processed {i}/{len(in_rows)}…")
+                np1 = [mech["strike1"], mech["dip1"], mech["rake1"]]
+                np2 = [mech["strike2"], mech["dip2"], mech["rake2"]]
 
-    # sort by time
-    out_rows.sort(key=lambda x: (x["time_iso"] or "", x["id"]))
-    write_mech_csv(out_rows, OUT_CSV)
-    print(f"wrote {OUT_CSV} with {len(out_rows)} events")
-    if misses:
-        print(f" {len(misses)} events missing mechanism/axes (see ComCat pages):")
-        for m in misses[:20]:
-            print("   -", m)
-        if len(misses) > 20:
-            print("   …")
+                # use API axes if present; else compute from plane 1
+                if all(k in mech and mech[k] is not None for k in
+                       ("T_plunge", "T_azimuth", "N_plunge", "N_azimuth", "P_plunge", "P_azimuth")):
+                    Tpl, Taz = mech["T_plunge"], mech["T_azimuth"]
+                    Npl, Naz = mech["N_plunge"], mech["N_azimuth"]
+                    Ppl, Paz = mech["P_plunge"], mech["P_azimuth"]
+                else:
+                    axes = axes_from_sdr(*np1)
+                    Tpl, Taz = axes["T_plunge"], axes["T_azimuth"]
+                    Npl, Naz = axes["N_plunge"], axes["N_azimuth"]
+                    Ppl, Paz = axes["P_plunge"], axes["P_azimuth"]
+
+                parsed_event = [event.id,
+                                event.time,
+                                event.longitude, event.latitude,
+                                event.depth,
+                                event.mag,
+                                event.magType,
+                                *np1, *np2,
+                                Tpl, Taz, Npl, Naz, Ppl, Paz,
+                                mech.get("source", "usgs")]
+                catalog.append(parsed_event)
+            else:
+                print(f"Event {i}, id={event.id}: no mechanism via ObsPy or USGS API")
+
+        else:
+            print(f'Event {i},  id: {event.id} has no focal mechanisms')
+
+
+    mechanism_catalog = pandas.DataFrame(data=catalog, columns=fieldnames)
+    mechanism_catalog = mechanism_catalog.sort_values(
+        by="time_iso",
+        key=lambda s: pandas.to_datetime(s, utc=True, errors="coerce"),
+        na_position="last"
+    )
+    mechanism_catalog.to_csv(output_file_prefix + f'_test.csv', sep=',', index=False)

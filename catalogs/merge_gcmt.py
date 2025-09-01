@@ -69,7 +69,7 @@ def parse_ndk_file(path: str) -> List[Row]:
         if not m1:
             continue
 
-        src       = m1.group(1)
+        src       = "gcmt"
         date_s    = m1.group(2)
         time_s    = m1.group(3)
         hdr_lat   = float(m1.group(4))
@@ -99,7 +99,20 @@ def parse_ndk_file(path: str) -> List[Row]:
             clat, clon, cdepth = hdr_lat, hdr_lon, hdr_depth
 
         centroid_time = origin_time + timedelta(seconds=tshift)
-
+        # --- L4: exponent + 6 tensor elements (values + uncertainties) ---
+        # Format: <exp>  Mrr  dMrr  Mtt  dMtt  Mpp  dMpp  Mrt  dMrt  Mrp  dMrp  Mtp  dMtp
+        # Units in dyne·cm × 10**exp  (convert to N·m by × 10**(exp-7))
+        Mrr = Mtt = Mpp = Mrt = Mrp = Mtp = None
+        try:
+            nums4 = re.findall(r'[+-]?\d+(?:\.\d+)?', l4)
+            if len(nums4) >= 13:
+                exp = int(float(nums4[0]))  # exponent for dyne·cm
+                # take the 6 values (skip 6 uncertainties)
+                mvals = [float(nums4[i]) for i in (1, 3, 5, 7, 9, 11)]
+                factor = 10 ** (exp - 7)    # dyne·cm -> N·m
+                Mrr, Mtt, Mpp, Mrt, Mrp, Mtp = [v * factor for v in mvals]
+        except Exception:
+            pass
         # --- L5: principal axes + best-DC nodal planes ---
         # Numbers only if preceded by whitespace/start to avoid grabbing the '10' from 'V10'
         nums5 = re.findall(r'(?:(?<=\s)|^)[+-]?\d+(?:\.\d+)?', l5)
@@ -124,14 +137,16 @@ def parse_ndk_file(path: str) -> List[Row]:
 
         # Magnitude rule
         Mw = mw_hdr if (mw_hdr is not None and mw_hdr > 0) else mb_val
+        mag_type = "Mw"
 
         rows.append(dict(
             id=ev_id,
             time_iso=centroid_time.isoformat(timespec="seconds"),
             longitude=clon,
             latitude=clat,
-            depth_km=cdepth,
-            Mw=float(Mw) if Mw is not None else None,
+            depth=cdepth,
+            mag=float(Mw) if Mw is not None else None,
+            mag_type=mag_type,
             # Nodal planes
             strike1=strike1, dip1=dip1, rake1=rake1,
             strike2=strike2, dip2=dip2, rake2=rake2,
@@ -139,7 +154,9 @@ def parse_ndk_file(path: str) -> List[Row]:
             T_plunge=T_plunge, T_azimuth=T_azimuth,
             N_plunge=N_plunge, N_azimuth=N_azimuth,
             P_plunge=P_plunge, P_azimuth=P_azimuth,
-            source=src,
+            # Moment tensor (RTP) in N·m
+            Mrr=Mrr, Mtt=Mtt, Mpp=Mpp, Mrt=Mrt, Mrp=Mrp, Mtp=Mtp,
+            source="gcmt",
         ))
 
     return rows
@@ -156,7 +173,7 @@ if __name__ == "__main__":
     MINDEPTH, MAXDEPTH = 0, 150
     MINMW, MAXMW = 4.9, 9.9
 
-    OUT_CSV = "merged_gcmt_mechanisms.csv"
+    OUT_CSV = "./global_2/merged_gcmt_mechanisms.csv"
 
     # Parse
     rows = []
@@ -165,7 +182,7 @@ if __name__ == "__main__":
 
     # Filter
     def in_bounds(r):
-        lat, lon, dep, mw = r["latitude"], r["longitude"], r["depth_km"], r["Mw"]
+        lat, lon, dep, mw = r["latitude"], r["longitude"], r["depth"], r["mag"]
         if lat is None or lon is None: return False
         if MINLAT is not None and lat < MINLAT: return False
         if MAXLAT is not None and lat > MAXLAT: return False
@@ -186,10 +203,12 @@ if __name__ == "__main__":
     # Sort & write
     rows.sort(key=lambda r: r["time_iso"])
     fieldnames = [
-        "id","time_iso","longitude","latitude","depth_km","Mw",
-        "strike1","dip1","rake1","strike2","dip2","rake2",
-        "T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth","source"
+        "id", "time_iso", "longitude", "latitude", "depth", "mag", "mag_type",
+        "strike1", "dip1", "rake1", "strike2", "dip2", "rake2",
+        "T_plunge", "T_azimuth", "N_plunge", "N_azimuth", "P_plunge", "P_azimuth",
+        "Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp", "source"
     ]
+
     import csv
     with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
