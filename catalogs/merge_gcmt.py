@@ -138,7 +138,7 @@ def parse_ndk_file(path: str) -> List[Row]:
         # Magnitude rule
         Mw = mw_hdr if (mw_hdr is not None and mw_hdr > 0) else mb_val
         mag_type = "Mw"
-
+        print(ev_id, clon, clat, Mw)
         rows.append(dict(
             id=ev_id,
             time_iso=centroid_time.isoformat(timespec="seconds"),
