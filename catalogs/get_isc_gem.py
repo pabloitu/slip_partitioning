@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import math
 import numpy as np
 import pandas as pd
@@ -14,8 +11,7 @@ FIELDS = [
 ]
 
 # Spatial filter (strict inequalities as requested)
-LAT_MIN, LAT_MAX = -54.0, -17.0
-LON_MIN, LON_MAX = -80.0, -65.0
+
 
 # --------------- helpers ---------------
 def _sf(x):

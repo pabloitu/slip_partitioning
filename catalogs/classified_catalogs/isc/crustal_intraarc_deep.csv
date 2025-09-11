@@ -1,0 +1,2 @@
+id,time_iso,longitude,latitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,class
+11931187,2007-04-21T17:53:46,-72.648,-45.243,36.7,6.2,mw,93.0,87.0,-1.0,183.0,89.0,-177.0,1.0,318.0,87.0,203.0,3.0,48.0,-25000000000.0,40000000000.0,-15000000000.0,-2000000000.0,13000000000.0,248000000000.0,NEIC,crustal_intraarc_deep

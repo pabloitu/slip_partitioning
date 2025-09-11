@@ -1,3 +1,0 @@
-time,latitude,longitude,depth,mag,magType,nst,gap,dmin,rms,net,id,updated,place,type,horizontalError,depthError,magError,magNst,status,locationSource,magSource
-2010-02-27T06:34:11.530Z,-36.122,-72.898,22.9,8.8,mww,454,17.8,,1.09,official,official20100227063411530_30,2025-08-08T18:56:44.947Z,"2010 Maule, Chile Earthquake",earthquake,,9.2,,,reviewed,us,official
-2010-02-20T09:55:11.220Z,-39.525,-75.057,35,4.9,mb,37,81.1,,0.94,us,usp000h7gh,2014-11-07T01:40:43.768Z,"145 km WNW of Corral, Chile",earthquake,,,,9,reviewed,us,us

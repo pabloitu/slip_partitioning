@@ -1,0 +1,2 @@
+id,time_iso,longitude,latitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,class
+C202408261621A,2024-08-26T16:21:51,-73.85,-44.93,72.0,5.0,mw,235.0,46.0,10.0,138.0,83.0,135.0,35.0,86.0,45.0,311.0,24.0,195.0,8650000000000000.0,-4.15e+16,3.29e+16,2.06e+16,-3.13e+16,8010000000000000.0,gcmt,crustal_intraarc_deep
