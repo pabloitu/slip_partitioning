@@ -1,357 +1,369 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple, Optional
+"""
+Merge + de-duplicate catalogs with two rules:
+
+R1 (strict): same canonical id -> merge
+   canonical id = lowercased id with ONE leading letter removed if it's followed by a digit
+   e.g., 'B010886A' -> '010886a', 'C201102051611A' -> '201102051611a'
+
+R2 (proximity): |Δt| ≤ 120 s  AND  distance ≤ 80 km  AND  |Δmag| ≤ 0.8 -> merge
+   (if coords or magnitudes are missing, R2 does NOT merge — avoids false positives)
+
+For each duplicate set, select fields by source priority (best provider per field).
+Outputs a single CSV with a 'dups' column listing merged duplicates as 'source:id'.
+"""
+
 import re
+from math import radians, sin, cos, asin, sqrt
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
 
-# ---- TUNABLE WINDOWS (temporal > spatial > magnitude) ----
-TIME_WINDOW_S  = 60     # seconds
-DIST_WINDOW_KM = 75     # km
-MAG_WINDOW     = 0.5    # magnitude units
-DUP_CRITERION  = "any"  # or "all"
-
-# ---- INPUTS (change paths if you like) ----
-GCMT_FILE = "./global_2/merged_gcmt_mechanisms.csv"
-USGS_FILE = "./global_2/anss_mechanisms.csv"
-ISC_FILE  = "./global_2/isc_mechanisms.txt"     # CSV with the same columns
-GMT_FILE  = "./global_2/GMT_1976_2025_consolidado_conSlab.csv"
-# ---- OUTPUT ----
+# -------------------- FILE PATHS --------------------
+GCMT_FILE = "global_2/merged_gcmt_mechanisms.csv"                    # GCMT (source column may be missing)
+USGS_FILE = "global_2/anss_mechanisms.csv"                           # USGS/ANSS (source values like 'us','iscgem')
+ISC_FILE  = "global_2/isc_mechanisms.txt"                            # ISC (source values like 'gfz','ipgp','neic','neis','sja')
+GMT_FILE  = "global_2/GMT_1976_2025_consolidado_conSlab.csv"         # custom GMT file
 OUT_MERGED = "merged_all_catalogs.csv"
 
-# ---- Expected schema (what we keep) ----
+# -------------------- DEDUP WINDOWS --------------------
+DT_NEAR_S = 120.0  # seconds
+KM_NEAR   = 80.0   # km
+DMAG_NEAR = 0.8    # magnitude units
+
+# -------------------- SOURCES & PRIORITY --------------------
+CANON = {
+    # GCMT / legacy
+    "gcmt": "gcmt", "cmt": "gcmt",
+    # USGS / ANSS variants
+    "us": "us", "usgs": "us", "anss": "us", "iscgem": "iscgem",
+    # ISC contributors
+    "gfz": "gfz", "neic": "neic", "neis": "neis", "ipgp": "ipgp", "sja": "sja", "isc": "isc",
+    # GMT
+    "gmt": "gmt",
+}
+PRIORITY = {
+    "gcmt": 3,
+    "us": 2,
+    "gmt": 1,
+    "gfz": 4,
+    "iscgem": 4,
+    "neic": 4,
+    "neis": 5,
+    "ipgp": 6,
+    "sja": 6,
+    "isc": 7,
+    "other": 9,
+}
+
+# -------------------- OUTPUT SCHEMA --------------------
 FIELDS = [
     "id","time_iso","longitude","latitude","depth","mag","mag_type",
     "strike1","dip1","rake1","strike2","dip2","rake2",
     "T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth",
-    "Mrr","Mtt","Mpp","Mrt","Mrp","Mtp","source"
+    "Mrr","Mtt","Mpp","Mrt","Mrp","Mtp","source","dups"
 ]
 
-# ---- Source normalization & priority ----
-def normalize_source(row: Dict[str, Any]) -> str:
-    sid = str(row.get("id", "")).strip()
-    src = (row.get("source") or "").strip().upper()
-
-    # GCMT: explicit or classic C... id
-    if "GCMT" in src or (sid.startswith("C") and any(ch.isalpha() for ch in sid[-1:])):
-        return "GCMT"
-    # USGS/ANSS
-    if src in {"US","USGS","ANSS"} or sid.lower().startswith("us"):
-        return "USGS"
-    # GFZ/NEIC/NEIS
-    if "GFZ" in src:  return "GFZ"
-    if "NEIC" in src: return "NEIC"
-    if "NEIS" in src: return "NEIS"
-    # GMT (your 4th catalog) maps to OTHER unless you change priority below
-    if "GMT" in src:  return "OTHER"
-    return "OTHER"
-
-PRIORITY = {
-    "GCMT": 0,
-    "USGS": 1,
-    "GFZ":  2,
-    "NEIC": 3,
-    "NEIS": 4,
-    "OTHER":5,
-}
-
-
-# ---- Helpers ----
-def _sf(x) -> Optional[float]:
+# ======================================================
+# Helpers
+# ======================================================
+def _finite(x) -> bool:
     try:
-        if x is None or (isinstance(x, float) and math.isnan(x)): return None
-        return float(x)
+        return np.isfinite(float(x))
     except Exception:
-        return None
-
-def haversine_km(lon1, lat1, lon2, lat2) -> float:
-    if None in (lon1, lat1, lon2, lat2):
-        return float("inf")
-    R = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dl   = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return 2*R*math.asin(math.sqrt(a))
-
-def _prefer_record(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    ra, rb = normalize_source(a), normalize_source(b)
-    pa, pb = PRIORITY.get(ra, 9), PRIORITY.get(rb, 9)
-    if pa != pb:
-        return a if pa < pb else b
-
-    a_has_planes = all(_sf(a.get(k)) is not None for k in ("strike1","dip1","rake1","strike2","dip2","rake2"))
-    b_has_planes = all(_sf(b.get(k)) is not None for k in ("strike1","dip1","rake1","strike2","dip2","rake2"))
-    if a_has_planes != b_has_planes:
-        return a if a_has_planes else b
-
-    a_has_ten = any(_sf(a.get(k)) is not None for k in ("Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"))
-    b_has_ten = any(_sf(b.get(k)) is not None for k in ("Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"))
-    if a_has_ten != b_has_ten:
-        return a if a_has_ten else b
-
-    ma, mb = _sf(a.get("mag")), _sf(b.get("mag"))
-    if (ma is not None) and (mb is not None) and (ma != mb):
-        return a if ma > mb else b
-
-    ta = pd.to_datetime(a.get("time_iso"), utc=True, errors="coerce")
-    tb = pd.to_datetime(b.get("time_iso"), utc=True, errors="coerce")
-    if pd.isna(ta) or pd.isna(tb):
-        return a
-    return a if ta <= tb else b
-
-def _within_windows_time(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    ta = pd.to_datetime(a.get("time_iso"), utc=True, errors="coerce")
-    tb = pd.to_datetime(b.get("time_iso"), utc=True, errors="coerce")
-    if pd.isna(ta) or pd.isna(tb):
         return False
-    return abs((tb - ta).total_seconds()) <= TIME_WINDOW_S
 
-def _within_windows_space_mag(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    da = haversine_km(_sf(a.get("longitude")), _sf(a.get("latitude")),
-                      _sf(b.get("longitude")), _sf(b.get("latitude")))
-    if da > DIST_WINDOW_KM:
-        return False
-    ma, mb = _sf(a.get("mag")), _sf(b.get("mag"))
-    if (ma is not None) and (mb is not None) and (abs(ma - mb) > MAG_WINDOW):
-        return False
-    return True
+def normalize_source(row: Dict[str, Any], file_hint: Optional[str] = None) -> str:
+    src = (row.get("source") or "").strip().lower()
+    if not src and file_hint:
+        src = file_hint.strip().lower()
+    return CANON.get(src, src if src else (file_hint or "other")).lower()
 
-def _within_windows_all(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    # full criterion used among timed records
-    return _within_windows_time(a, b) and _within_windows_space_mag(a, b)
+def rank_source(src: str) -> int:
+    return PRIORITY.get((src or "other").lower(), PRIORITY["other"])
 
-# ---- Catalog loaders ----
-def load_catalog_generic(path: str, source_hint: str = "") -> pd.DataFrame:
-    df = pd.read_csv(path)
-    for col in FIELDS:
+# Canonicalize ID: lower, strip; remove a SINGLE leading letter if next char is a digit.
+_LETTER_DIGIT = re.compile(r'^[A-Za-z](\d.*)$')
+def canonical_id(s: Any) -> str:
+    s = (str(s or "")).strip().lower()
+    m = _LETTER_DIGIT.match(s)
+    return m.group(1) if m else s
+
+def haversine_km(lon1, lat1, lon2, lat2):
+    """Great-circle distance in km; returns inf if any coord missing."""
+    if not all(_finite(v) for v in (lon1, lat1, lon2, lat2)):
+        return np.inf
+    lon1, lat1, lon2, lat2 = map(radians, [float(lon1), float(lat1), float(lon2), float(lat2)])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2.0)**2 + cos(lat1)*cos(lat2)*sin(dlon/2.0)**2
+    c = 2.0 * asin(sqrt(a))
+    return 6371.0 * c  # km
+
+def ensure_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all possible output fields exist (filled with NaN)."""
+    needed = set(FIELDS) - {"dups"}
+    for col in needed:
         if col not in df.columns:
             df[col] = np.nan
+    return df
+
+# ======================================================
+# Loaders
+# ======================================================
+def load_catalog_generic(path: str, source_hint: Optional[str] = None) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df = ensure_fields(df)
+    if "source" not in df.columns:
+        df["source"] = np.nan
+    df["source"] = df["source"].astype(str).str.strip().str.lower()
     if source_hint:
-        df["source"] = df["source"].fillna(source_hint).replace("", source_hint)
+        df["source"] = df["source"].where(
+            (df["source"] != "") & (df["source"] != "nan"), other=source_hint.strip().lower()
+        )
+    # keep time_iso as string
     df["time_iso"] = df["time_iso"].astype(str)
-    return df[FIELDS].copy()
+    return df
 
+_GMT_TIME_RE = re.compile(r"^(\d{12})[A-Za-z]$")  # YYYYMMDDhhmm + trailing letter
 
-def _time_from_gmt_id(eid: str) -> Optional[str]:
-    """
-    Parse time from GMT ID like '200503302331A' -> '2005-03-30T23:31:00'.
-    Only applies to modern IDs starting with '20' and having 12 digits (+ optional trailing letter).
-    Returns ISO string (UTC, seconds=00) or None if not parseable.
-    """
-    if not eid:
+def _gmt_id_to_time_iso(gmt_id: str) -> Optional[str]:
+    s = str(gmt_id or "").strip()
+    m = _GMT_TIME_RE.match(s)
+    if not m:
         return None
-    s = str(eid).strip()
-    # remove trailing letter if present
-    if s and s[-1].isalpha():
-        s = s[:-1]
-    # must be 12 digits and start with '20' (YYYYMMDDhhmm)
-    if not re.fullmatch(r"20\d{10}", s):
-        return None
-    try:
-        dt = datetime.strptime(s, "%Y%m%d%H%M")
-        return dt.isoformat(timespec="seconds")  # seconds = 00
-    except Exception:
-        return None
+    digits = m.group(1)
+    yyyy = int(digits[0:4]); mm = int(digits[4:6]); dd = int(digits[6:8])
+    hh   = int(digits[8:10]); mi = int(digits[10:12])
+    return f"{yyyy:04d}-{mm:02d}-{dd:02d}T{hh:02d}:{mi:02d}:00"
 
 def load_gmt(path: str) -> pd.DataFrame:
     """
-    Map GMT csv:
-    ID,Lat,Lon,Depth_km,Mw,Strike_1,Dip_1,Rake_1,P_trend,P_plunge,T_trend,T_plunge,
-    Strike_2,Dip_2,Rake_2,Strike_2_c,Dip_2_cal,Rake_2_cal,Slab1,Depth2Slab
-    -> our FIELDS. time is recovered from ID when possible (post-2005 form).
+    GMT CSV columns:
+      ID,Lat,Lon,Depth_km,Mw,Strike_1,Dip_1,Rake_1,P_trend,P_plunge,T_trend,T_plunge,
+      Strike_2,Dip_2,Rake_2,Strike_2_c,Dip_2_cal,Rake_2_cal,Slab1,Depth2Slab
     """
     raw = pd.read_csv(path)
-
-    def pick(a, b):
-        return a if pd.notna(a) else b
-
-    # Prefer explicit second plane; fall back to *_cal if missing
-    s2  = raw.get("Strike_2",   pd.Series([np.nan]*len(raw)))
-    d2  = raw.get("Dip_2",      pd.Series([np.nan]*len(raw)))
-    r2  = raw.get("Rake_2",     pd.Series([np.nan]*len(raw)))
-    s2c = raw.get("Strike_2_c", pd.Series([np.nan]*len(raw)))
-    d2c = raw.get("Dip_2_cal",  pd.Series([np.nan]*len(raw)))
-    r2c = raw.get("Rake_2_cal", pd.Series([np.nan]*len(raw)))
-
-    # recover times from ID when possible
-    time_iso = [ _time_from_gmt_id(str(eid)) for eid in raw["ID"].astype(str) ]
-
     out = pd.DataFrame({
-        "id":        raw["ID"].astype(str),
-        "time_iso":  pd.Series(time_iso, dtype="object"),
-        "longitude": raw["Lon"],
-        "latitude":  raw["Lat"],
-        "depth":     raw["Depth_km"],
-        "mag":       raw["Mw"],
-        "mag_type":  pd.Series(["Mw"]*len(raw)),
-        "strike1":   raw["Strike_1"],
-        "dip1":      raw["Dip_1"],
-        "rake1":     raw["Rake_1"],
-        "strike2":   [pick(s2.iloc[i], s2c.iloc[i]) for i in range(len(raw))],
-        "dip2":      [pick(d2.iloc[i], d2c.iloc[i]) for i in range(len(raw))],
-        "rake2":     [pick(r2.iloc[i], r2c.iloc[i]) for i in range(len(raw))],
-        "T_plunge":  raw.get("T_plunge", pd.Series([np.nan]*len(raw))),
-        "T_azimuth": raw.get("T_trend",  pd.Series([np.nan]*len(raw))),
-        "N_plunge":  pd.Series([np.nan]*len(raw)),
-        "N_azimuth": pd.Series([np.nan]*len(raw)),
-        "P_plunge":  raw.get("P_plunge", pd.Series([np.nan]*len(raw))),
-        "P_azimuth": raw.get("P_trend",  pd.Series([np.nan]*len(raw))),
-        "Mrr":       pd.Series([np.nan]*len(raw)),
-        "Mtt":       pd.Series([np.nan]*len(raw)),
-        "Mpp":       pd.Series([np.nan]*len(raw)),
-        "Mrt":       pd.Series([np.nan]*len(raw)),
-        "Mrp":       pd.Series([np.nan]*len(raw)),
-        "Mtp":       pd.Series([np.nan]*len(raw)),
-        "source":    pd.Series(["GMT"]*len(raw)),
+        "id":        raw.get("ID"),
+        "time_iso":  raw["ID"].apply(_gmt_id_to_time_iso),
+        "latitude":  raw.get("Lat"),
+        "longitude": raw.get("Lon"),
+        "depth":     raw.get("Depth_km"),
+        "mag":       raw.get("Mw"),
+        "mag_type":  pd.Series(["mw"] * len(raw)),
+        "strike1":   raw.get("Strike_1"),
+        "dip1":      raw.get("Dip_1"),
+        "rake1":     raw.get("Rake_1"),
+        "strike2":   raw.get("Strike_2"),
+        "dip2":      raw.get("Dip_2"),
+        "rake2":     raw.get("Rake_2"),
+        "T_plunge":  raw.get("T_plunge"),
+        "T_azimuth": raw.get("T_trend"),
+        "P_plunge":  raw.get("P_plunge"),
+        "P_azimuth": raw.get("P_trend"),
+        "N_plunge":  np.nan,
+        "N_azimuth": np.nan,
+        "Mrr": np.nan, "Mtt": np.nan, "Mpp": np.nan, "Mrt": np.nan, "Mrp": np.nan, "Mtp": np.nan,
+        "source":    pd.Series(["gmt"] * len(raw)),
     })
+    return ensure_fields(out)
 
-    # numeric casts
-    for col in ["longitude","latitude","depth","mag",
-                "strike1","dip1","rake1","strike2","dip2","rake2",
-                "T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth",
-                "Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-
-    return out[FIELDS].copy()
-# ---- Clustering ----
-def cluster_records(records: List[Dict[str, Any]]) -> List[List[int]]:
-    """
-    Cluster duplicates:
-    - Timed records clustered with time+space+mag windows.
-    - Untimed records are attached to any cluster if they match space+mag with ANY member (time ignored).
-      Otherwise, each untimed record becomes its own cluster.
-    """
-    N = len(records)
-    times = pd.to_datetime([r.get("time_iso") for r in records], utc=True, errors="coerce")
-    ns = times.astype("int64")  # NaT -> -9223372036854775808
-    order = np.argsort(ns, kind="mergesort")
-    seconds = (ns.astype("float64") / 1e9).values
-    seconds_sorted = seconds[order]
-
-    timed_mask = ~pd.isna(times)
-    timed_idx  = [i for i in order if timed_mask[i]]
-    untimed_idx= [i for i in order if not timed_mask[i]]
-
-    visited = np.zeros(N, dtype=bool)
-    clusters: List[List[int]] = []
-
-    # 1) Cluster timed records
-    idx_to_pos = {order[pos]: pos for pos in range(N)}  # position in sorted order
-    for idx in timed_idx:
-        if visited[idx]:
-            continue
-        pos = idx_to_pos[idx]
-        t0 = seconds_sorted[pos]
-
-        # time window bounds in the sorted array
-        left = pos
-        while left - 1 >= 0 and seconds_sorted[left - 1] >= t0 - TIME_WINDOW_S:
-            left -= 1
-        right = pos
-        while right + 1 < N and seconds_sorted[right + 1] <= t0 + TIME_WINDOW_S:
-            right += 1
-
-        cand = [order[k] for k in range(left, right + 1) if (order[k] in timed_idx and not visited[order[k]])]
-        cluster = [idx]
-        visited[idx] = True
-
-        if DUP_CRITERION.lower() == "all":
-            for j in cand:
-                if j == idx or visited[j]: continue
-                if _within_windows_all(records[idx], records[j]):
-                    visited[j] = True
-                    cluster.append(j)
+# ======================================================
+# Union–Find (Disjoint Set)
+# ======================================================
+class DSU:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+        self.r = [0] * n
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+    def union(self, a: int, b: int):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb: return
+        if self.r[ra] < self.r[rb]:
+            self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]:
+            self.p[rb] = ra
         else:
-            # 'any' union BFS inside time window
-            frontier = [idx]
-            available = set(cand); available.discard(idx)
-            while frontier:
-                k = frontier.pop()
-                hits = [j for j in list(available) if _within_windows_all(records[k], records[j])]
-                for j in hits:
-                    available.remove(j)
-                    visited[j] = True
-                    cluster.append(j)
-                    frontier.append(j)
+            self.p[rb] = ra
+            self.r[ra] += 1
 
-        clusters.append(cluster)
+# ======================================================
+# De-dup: R1 (same canonical id) + R2 (time+space+mag)
+# ======================================================
+def dedup_clusters(records: List[Dict[str, Any]]) -> List[List[int]]:
+    n = len(records)
+    dsu = DSU(n)
 
-    # 2) Attach untimed records by space+mag to ANY member of any existing cluster
-    for idx in untimed_idx:
-        if visited[idx]:
-            continue
-        attached = False
-        for cl in clusters:
-            # quick prune: compare to best (preferred) or 1st member; but safer to check any member
-            for m in cl:
-                if _within_windows_space_mag(records[idx], records[m]):
-                    cl.append(idx)
-                    visited[idx] = True
-                    attached = True
-                    break
-            if attached:
+    # --- R1: same canonical id
+    cids = [canonical_id(r.get("id")) for r in records]
+    by_id: Dict[str, List[int]] = {}
+    for i, cid in enumerate(cids):
+        if cid:  # non-empty
+            by_id.setdefault(cid, []).append(i)
+    for idxs in by_id.values():
+        for a, b in zip(idxs, idxs[1:]):
+            dsu.union(a, b)
+
+    # --- Precompute arrays for R2
+    times = pd.to_datetime([r.get("time_iso") for r in records], utc=True, errors="coerce")
+    valid_time = times.notna()
+    # seconds since epoch for valid times
+    tsec = pd.Series(np.full(n, np.nan))
+    tsec.loc[valid_time] = (times[valid_time].astype("int64") // 10**9).astype(float)
+
+    lons = np.array([r.get("longitude") for r in records], dtype=object)
+    lats = np.array([r.get("latitude")  for r in records], dtype=object)
+    mags = np.array([r.get("mag")       for r in records], dtype=object)
+
+    # indices of valid times sorted by time
+    idx_valid = np.where(valid_time)[0]
+    order = idx_valid[np.argsort(tsec.loc[idx_valid].to_numpy())]
+
+    # --- R2 sweep: within 120s AND within 80 km AND |Δmag| ≤ 0.8
+    for pos_i, i in enumerate(order):
+        ti = tsec.iloc[i]
+        jpos = pos_i + 1
+        while jpos < len(order):
+            j = order[jpos]
+            tj = tsec.iloc[j]
+            dt = tj - ti  # >= 0
+
+            if dt > DT_NEAR_S:
                 break
-        if not attached:
-            # its own cluster
-            clusters.append([idx])
-            visited[idx] = True
 
-    return clusters
+            # require coords and magnitudes to be finite
+            if all(_finite(x) for x in (lons[i], lats[i], lons[j], lats[j], mags[i], mags[j])):
+                dkm = haversine_km(lons[i], lats[i], lons[j], lats[j])
+                dmag = abs(float(mags[i]) - float(mags[j]))
+                if (dkm <= KM_NEAR) and (dmag <= DMAG_NEAR):
+                    dsu.union(i, j)
 
-# ---- Merge driver ----
-def merge_four(gcmt_path: str, usgs_path: str, isc_path: str, gmt_path: str, out_path: str):
-    df_gcmt = load_catalog_generic(gcmt_path, source_hint="GCMT")
-    df_usgs = load_catalog_generic(usgs_path)  # already has 'source'
-    df_isc  = load_catalog_generic(isc_path)   # already has 'source'
-    df_gmt  = load_gmt(gmt_path)
+            jpos += 1
 
-    all_df = pd.concat([df_gcmt, df_usgs, df_isc, df_gmt], ignore_index=True)
+    # collect components
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = dsu.find(i)
+        groups.setdefault(r, []).append(i)
+
+    return list(groups.values())
+
+# ======================================================
+# Field-wise selection by source priority
+# ======================================================
+def _choose_by_priority(records: List[Dict[str, Any]], idxs: List[int],
+                        fields: Optional[List[str]], require_all: bool) -> Optional[Dict[str, Any]]:
+    best = None; best_rank = 10**9
+    for ii in idxs:
+        r = records[ii]
+        rk = rank_source(normalize_source(r))
+        ok = True
+        if fields:
+            for k in fields:
+                v = r.get(k, None)
+                if require_all:
+                    if k in ("Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"):
+                        if not _finite(v): ok = False; break
+                    else:
+                        if v is None or (isinstance(v, str) and v.strip() == ""):
+                            ok = False; break
+                        if not isinstance(v, str) and not _finite(v):
+                            ok = False; break
+        if ok and rk < best_rank:
+            best = r; best_rank = rk
+    return best
+
+def assemble_output_record(records: List[Dict[str, Any]], idxs: List[int]) -> Dict[str, Any]:
+    # global "best" for id/time/source (does not force field completeness)
+    glob = _choose_by_priority(records, idxs, fields=None, require_all=False) or records[idxs[0]]
+
+    # per-field winners
+    loc   = _choose_by_priority(records, idxs, ["longitude","latitude","depth"], require_all=True) or glob
+    magr  = _choose_by_priority(records, idxs, ["mag","mag_type"], require_all=True) or glob
+    ten   = _choose_by_priority(records, idxs, ["Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"], require_all=True)
+    sdr   = _choose_by_priority(records, idxs, ["strike1","dip1","rake1","strike2","dip2","rake2"], require_all=True)
+    axes  = _choose_by_priority(records, idxs, ["T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth"], require_all=True)
+
+    out: Dict[str, Any] = {}
+    out["id"]       = glob.get("id")
+    out["time_iso"] = glob.get("time_iso")
+    out["source"]   = normalize_source(glob)
+
+    out["longitude"] = loc.get("longitude")
+    out["latitude"]  = loc.get("latitude")
+    out["depth"]     = loc.get("depth")
+
+    out["mag"]      = magr.get("mag")
+    mt = magr.get("mag_type")
+    out["mag_type"] = (mt.lower() if isinstance(mt, str) else mt)
+
+    for k in ("Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"):
+        out[k] = ten.get(k) if ten is not None else None
+
+    for k in ("strike1","dip1","rake1","strike2","dip2","rake2"):
+        out[k] = sdr.get(k) if sdr is not None else None
+
+    for k in ("T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth"):
+        out[k] = axes.get(k) if axes is not None else None
+
+    # dups list (exclude chosen id)
+    chosen_id = str(out.get("id", ""))
+    dups = []
+    for ii in idxs:
+        rid = str(records[ii].get("id", ""))
+        if rid == chosen_id:
+            continue
+        dups.append(f"{normalize_source(records[ii])}:{rid}")
+    out["dups"] = ";".join(dups)
+
+    return out
+
+# ======================================================
+# Driver
+# ======================================================
+def merge_and_dedup(gcmt_path: str, usgs_path: str, isc_path: str, gmt_path: str, out_path: str):
+    # Load with hints where needed
+    df_gcmt = load_catalog_generic(gcmt_path, source_hint="gcmt")
+    df_usgs = load_catalog_generic(usgs_path)   # per-row source present
+    df_isc  = load_catalog_generic(isc_path)    # per-row source present
+    df_gmt  = load_gmt(gmt_path)                # fixed 'gmt'
+
+    all_df = pd.concat([df_gcmt, df_usgs, df_isc, df_gmt], ignore_index=True, sort=False)
+    # normalize source column to canonical lower-case for all rows
+    if "source" not in all_df.columns:
+        all_df["source"] = np.nan
+    all_df["source"] = all_df["source"].astype(str).str.strip().str.lower()
+
     records = all_df.to_dict("records")
 
-    clusters = cluster_records(records)
+    # build duplicate clusters using R1 + R2
+    clusters = dedup_clusters(records)
 
-    merged_rows: List[Dict[str, Any]] = []
-    for cl in clusters:
-        # pick preferred record
-        best = records[cl[0]]
-        for idx in cl[1:]:
-            best = _prefer_record(best, records[idx])
+    # assemble merged rows
+    merged = [assemble_output_record(records, cl) for cl in clusters]
+    out_df = pd.DataFrame(merged)
 
-        # collect duplicates
-        dup_pairs = []
-        best_id = str(best.get("id", ""))
-        for idx in cl:
-            rid = str(records[idx].get("id", ""))
-            if rid == best_id:
-                continue
-            src = normalize_source(records[idx])
-            dup_pairs.append(f"{src}:{rid}")
-
-        out = {k: best.get(k, None) for k in FIELDS}
-        out["source"] = normalize_source(best)
-        out["dups"]   = ";".join(dup_pairs) if dup_pairs else ""
-        merged_rows.append(out)
-
-    out_df = pd.DataFrame(merged_rows)
+    # sort by time
     if not out_df.empty:
         out_df = out_df.sort_values(
             by="time_iso",
             key=lambda s: pd.to_datetime(s, utc=True, errors="coerce"),
             na_position="last"
         )
-        cols = FIELDS.copy()
-        if "dups" not in cols:
-            cols.append("dups")
+        cols = [c for c in FIELDS if c in out_df.columns]
         out_df.to_csv(out_path, index=False, columns=cols)
-    print(f"Wrote {out_path} with {len(out_df)} merged events "
+
+    print(f"Wrote {out_path} with {len(out_df)} events "
           f"(from {len(all_df)} inputs across {len(clusters)} clusters).")
 
-# ---- main ----
+# ------------------------------------------------------
 if __name__ == "__main__":
-    merge_four(GCMT_FILE, USGS_FILE, ISC_FILE, GMT_FILE, OUT_MERGED)
-
-# ---- main ---
+    merge_and_dedup(GCMT_FILE, USGS_FILE, ISC_FILE, GMT_FILE, OUT_MERGED)

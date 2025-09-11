@@ -172,30 +172,34 @@ def get_quakeml_bytes(row,
         return None
 
     # 2) find FM/MT products; if neither exists, DO NOT retry
-    fm_prods = []
-    mt_prods = []
-    try:
-        fm_prods = ev.getProducts("focal-mechanism") or []
-    except Exception:
-        fm_prods = []
-    try:
-        mt_prods = ev.getProducts("moment-tensor") or []
-    except Exception:
-        mt_prods = []
+    # Try FM/MT first; if nothing usable, fall back to phase-data/origin
+    ptypes_primary = ("focal-mechanism", "moment-tensor")
+    ptypes_fallback = ("phase-data", "origin")
 
-    if not fm_prods and not mt_prods:
-        # deterministic absence -> no retry
-        # (You can log this if you want to re-check later with a different source)
-        # print(f"[{eid}] no FM/MT products in ComCat")
+    def _safe_get(ev, name):
+        try:
+            return ev.getProducts(name) or []
+        except Exception:
+            return []
+
+    # collect candidates, US preferred, then all
+    def _collect(ptypes):
+        out = []
+        for ptype in ptypes:
+            prods = _safe_get(ev, ptype)
+            if not prods:
+                continue
+            us = [p for p in prods if getattr(p, "source", None) == "us"]
+            out += (us if us else prods)
+        return out
+
+    candidates = _collect(ptypes_primary)
+    if not candidates:
+        candidates = _collect(ptypes_fallback)
+
+    if not candidates:
+        # deterministic absence -> skip
         return None
-
-    # prefer USGS source; else first
-    def _pick(prods):
-        if not prods: return []
-        us = [p for p in prods if getattr(p, "source", None) == "us"]
-        return us if us else prods
-
-    candidates = _pick(fm_prods) + _pick(mt_prods)
 
     # 3) try to extract any quakeml*.xml(.gz) content; retry ONLY if we fail to download/parse bytes
     # scan available content names first (shortest names first)
@@ -275,13 +279,30 @@ def parse_quakeml_row(xml_bytes: bytes, row) -> dict | None:
         depth = _sf(row.get("depth"))    # CSV already in km
 
     # magnitude (prefer Mw from QuakeML; else CSV)
-    mag = mag_type = None
+    pref_order = ["mww", "mwc", "mwr", "mwb", "mw"]
+
+    mag = None
+    mag_type = None
+    best_rank = 10 ** 9
+
     for m in (getattr(ev, "magnitudes", None) or []):
-        t = (getattr(m, "magnitude_type", None) or "").upper()
-        if t.startswith("MW") and m.mag is not None:
-            mag, mag_type = float(m.mag), "Mw"; break
+        t = (getattr(m, "magnitude_type", None) or "").strip().lower()
+        if not t.startswith("mw"):
+            continue
+        if m.mag is None:
+            continue
+        # rank by preference list; unknown Mw subtypes rank like plain Mw
+        rank = pref_order.index(t) if t in pref_order else pref_order.index("mw")
+        if rank < best_rank:
+            best_rank = rank
+            mag = float(m.mag)
+            mag_type = t
+
     if mag is None:
-        mag, mag_type = _sf(row.get("mag")), (row.get("magType") or "Mw")
+        # fallback to CSV
+        mag = _sf(row.get("mag"))
+        mt = row.get("magType") or row.get("mag_type")
+        mag_type = (str(mt).strip().lower() if mt is not None else None)
 
     # planes, axes, tensor
     s1, d1, r1, s2, d2, r2 = (None,) * 6
@@ -319,7 +340,7 @@ def parse_quakeml_row(xml_bytes: bytes, row) -> dict | None:
     have_axes   = None not in (T_pl, T_az, N_pl, N_az, P_pl, P_az)
 
     if not (have_planes or have_tensor or have_axes):
-        # No mechanism info at all; skip
+        print(f"[{row.get('id')}] no mechanism in parsed QuakeML – skipped")
         return None
 
     # id & source
