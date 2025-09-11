@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Render beachball PNGs for every classified catalog.
+
+- Scans classified_catalogs/<source>/ for a single overall "*_classified.csv"
+  (ignores per-class CSVs named after class labels).
+- Writes beachballs to: classified_catalogs/<source>/beachballs/<id>.png
+- Parallelized with ProcessPoolExecutor (process-based; safe for Matplotlib).
+
+Color map and classes match your pipeline.
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Must be set BEFORE importing pyplot
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from obspy.imaging.beachball import beachball as bb
+
+# ---------- ROOT INPUT ----------
+ROOT = "classified_catalogs"  # contains subfolders: gcmt, anss, isc, gmt, merged, full, ...
+
+# ---------- BEACHBALL SETTINGS ----------
+BB_SIZE_PT  = 220               # beachball width (points)
+MAX_WORKERS = None              # None -> os.cpu_count()
+DPI_OUT     = 30                # low DPI (QGIS symbol usage)
+FMT         = "png"             # png w/ transparent outside
+
+# ---------- CLASSES & COLORS ----------
+CLASSES = [
+    "crustal_intraarc_shallow",
+    "crustal_intraarc_deep",
+    "subduction_interface",
+    "subduction_intraslab",
+    "deep_subduction",
+    "outer_rise",
+    "forearc",
+    "deep",
+    "unclassified",
+]
+
+CLASS_COLORS = {
+    "crustal_intraarc_shallow": "limegreen",
+    "crustal_intraarc_deep":    "darkgreen",
+    "subduction_interface":     "deepskyblue",
+    "subduction_intraslab":     "teal",
+    "deep_subduction":          "red",
+    "outer_rise":               "burlywood",
+    "forearc":                  "orange",
+    "deep":                     "firebrick",
+    "unclassified":             "#7f7f7f",
+}
+DEFAULT_COLOR = "#7f7f7f"
+
+# ---------- helpers ----------
+def _finite(x):
+    try:
+        return np.isfinite(float(x))
+    except Exception:
+        return False
+
+def has_tensor(row) -> bool:
+    """
+    True only if all 6 components are finite AND not all zero.
+    (So a 0/0/0/0/0/0 tensor falls back to nodal planes.)
+    """
+    comps = []
+    for k in ("Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp"):
+        v = row.get(k)
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(f):
+            return False
+        comps.append(f)
+    EPS = 1e-12
+    return any(abs(f) > EPS for f in comps)
+
+def has_sdr(row) -> bool:
+    return all(_finite(row.get(k)) for k in ("strike1","dip1","rake1"))
+
+def get_class(row) -> str:
+    # robust: find column named 'class' ignoring case
+    for k in row.keys():
+        if str(k).strip().lower() == "class":
+            return str(row[k]).strip()
+    return "unclassified"
+
+def class_color(label: str) -> str:
+    return CLASS_COLORS.get(label, DEFAULT_COLOR)
+
+def draw_one_png(out_path: str, facecolor: str, mt=None, sdr=None, width_pt=220):
+    # Dedicated figure per event
+    fig = plt.figure(figsize=(width_pt/72.0, width_pt/72.0), dpi=72)
+    fig.patch.set_alpha(0.0)  # transparent figure background
+
+    if mt is not None:
+        bb(mt, width=width_pt, facecolor=facecolor, edgecolor="black",
+           linewidth=0.8, bgcolor="w", fig=fig)
+    else:
+        bb(tuple(sdr), width=width_pt, facecolor=facecolor, edgecolor="black",
+           linewidth=0.8, bgcolor="w", fig=fig)
+
+    for ax in fig.axes:
+        ax.set_facecolor("none")
+        ax.set_xticks([]); ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, format=FMT, dpi=DPI_OUT,
+                bbox_inches="tight", pad_inches=0.0, transparent=True)
+    plt.close(fig)
+
+# ---------- worker (top-level for multiprocessing) ----------
+def _render_worker(row_dict):
+    """
+    row_dict must contain a key '__outdir' with the destination folder.
+    Returns ('mt'|'sdr'|'skip'|'err', event_id, msg_if_err_or_reason)
+    """
+    try:
+        out_dir = row_dict.get("__outdir")
+        if not out_dir:
+            return ("err", "", "missing __outdir")
+
+        # Normalize event id
+        eid_raw = row_dict.get("id")
+        eid = "" if eid_raw is None else str(eid_raw).strip()
+        if not eid or eid.lower() == "nan":
+            return ("skip", eid, "no id")
+
+        label = get_class(row_dict)
+        color = class_color(label)
+        out_path = os.path.join(out_dir, f"{eid}.png")
+
+        if has_tensor(row_dict):
+            mt = [float(row_dict["Mrr"]), float(row_dict["Mtt"]), float(row_dict["Mpp"]),
+                  float(row_dict["Mrt"]), float(row_dict["Mrp"]), float(row_dict["Mtp"])]
+            draw_one_png(out_path, color, mt=mt, sdr=None, width_pt=BB_SIZE_PT)
+            return ("mt", eid, "")
+        elif has_sdr(row_dict):
+            sdr = (float(row_dict["strike1"]), float(row_dict["dip1"]), float(row_dict["rake1"]))
+            draw_one_png(out_path, color, mt=None, sdr=sdr, width_pt=BB_SIZE_PT)
+            return ("sdr", eid, "")
+        else:
+            return ("skip", eid, "no MT/SDR")
+    except Exception as e:
+        return ("err", str(row_dict.get("id", "")), str(e))
+
+# ---------- catalog discovery ----------
+def _is_per_class_file(path: str) -> bool:
+    """Return True if the filename is exactly one of the class CSVs (we skip those)."""
+    name = os.path.splitext(os.path.basename(path))[0].strip().lower()
+    return name in {c.lower() for c in CLASSES}
+
+def find_catalog_csvs(root: str):
+    """
+    Yield tuples (source_name, csv_path, out_beachballs_dir).
+    Finds one "*_classified.csv" per source folder, skipping per-class files.
+    """
+    if not os.path.isdir(root):
+        return
+    for entry in sorted(os.listdir(root)):
+        src_dir = os.path.join(root, entry)
+        if not os.path.isdir(src_dir):
+            continue
+        # look for *_classified.csv
+        candidates = [p for p in glob.glob(os.path.join(src_dir, "*.csv"))
+                      if p.lower().endswith("_classified.csv") and not _is_per_class_file(p)]
+        if not candidates:
+            # fallback: any CSV with a 'class' column (but not per-class names)
+            for p in glob.glob(os.path.join(src_dir, "*.csv")):
+                if _is_per_class_file(p):
+                    continue
+                try:
+                    head = pd.read_csv(p, nrows=1)
+                    if any(c.strip().lower() == "class" for c in head.columns):
+                        candidates.append(p)
+                        break
+                except Exception:
+                    pass
+        if not candidates:
+            continue
+        # choose the first deterministically
+        csv_path = sorted(candidates)[0]
+        out_dir = os.path.join(src_dir, "beachballs")
+        yield (entry, csv_path, out_dir)
+
+# ---------- run one catalog ----------
+def render_catalog(csv_path: str, out_dir: str, max_workers=MAX_WORKERS):
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.read_csv(csv_path)
+    if "id" not in df.columns:
+        print(f"[skip] {csv_path} has no 'id' column.")
+        return
+
+    rows = df.to_dict("records")
+    # inject per-row outdir for worker
+    for r in rows:
+        r["__outdir"] = out_dir
+
+    ok_mt = ok_sdr = skipped = errs = 0
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_render_worker, r) for r in rows]
+        for fut in as_completed(futures):
+            kind, eid, msg = fut.result()
+            if kind == "mt":
+                ok_mt += 1
+            elif kind == "sdr":
+                ok_sdr += 1
+            elif kind == "skip":
+                skipped += 1
+            else:
+                errs += 1
+
+    total = len(rows)
+    print(f"[{os.path.basename(os.path.dirname(out_dir))}] MT: {ok_mt}, SDR: {ok_sdr}, "
+          f"skipped: {skipped}, errors: {errs}, total: {total}.  -> {out_dir}")
+
+# ---------- main ----------
+def main():
+    any_found = False
+    for source_name, csv_path, out_dir in find_catalog_csvs(ROOT):
+        any_found = True
+        print(f"Rendering {source_name} catalog: {csv_path}")
+        render_catalog(csv_path, out_dir, MAX_WORKERS)
+    if not any_found:
+        print(f"No catalogs found under: {ROOT}")
+
+if __name__ == "__main__":
+    main()
