@@ -2,15 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-Classifier (placeholder MECH checks) for Andean subduction zone (Chile).
+Classifier for Andean subduction (Chile) — MECH checks disabled for now.
 
-- Uses fixed convergence azimuth = 78° (but mechanism checks are currently relaxed/placeholder).
-- Outer-rise: west of trench polyline.
-- Intra-arc shallow/deep by polygon and depth thresholds.
-- Subduction domain logic by proximity to slab surface and depth windows.
-- Writes: one classified CSV per catalog + per-class CSVs, under classified_catalogs/<catalog_name>/.
-
-NOTE: Slab depth sign — set SLAB_DEPTH_IS_POSITIVE_DOWN accordingly.
+Rules (in order):
+1) Inside intra-arc polygon:
+   (a) If NO slab nearby:
+       - depth <= INTRA_ARC_SHALLOW_MAX          -> crustal_intraarc_shallow
+       - INTRA_ARC_SHALLOW_MAX < depth <= 90 km  -> crustal_intraarc_deep
+       - depth > 90 km                            -> slab_deep
+   (b) If slab is defined:
+       - depth >= slab_depth + DEEP_SLAB_TOL      -> slab_deep
+       - depth <= INTRA_ARC_SHALLOW_MAX           -> crustal_intraarc_shallow
+       - else                                     -> crustal_intraarc_deep
+2) WEST (oceanward) of trench line                -> outer_rise
+3) EAST of intra-arc polygon AND depth < 50 km    -> backarc
+4) Subduction domain (slab defined AND slab_depth ≤ 70 km):
+   - depth <= slab_depth - INTERFACE_DEPTH_TOL    -> forearc
+   - |depth - slab_depth| <= INTERFACE_DEPTH_TOL  -> slab_interface
+   - depth >= slab_depth + INTERFACE_DEPTH_TOL    -> intra_slab
+5) slab_depth > 70 km (and slab defined)          -> slab_deep
+6) Otherwise                                      -> unclassified
 """
 
 import os
@@ -18,58 +29,52 @@ import math
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 
 from shapely.geometry import Point
+from shapely.ops import unary_union
 import geopandas as gpd
 from scipy.spatial import cKDTree
 
 # ------------------ TUNABLES ------------------
-# Intra-arc
-INTRA_ARC_SHALLOW_MAX = 32.0
-INTRA_ARC_DEEP_MARGIN = 10.0
+INTRA_ARC_SHALLOW_MAX = 32.0    # km
+DEEP_SLAB_TOL         = 10.0    # km (inside intra-arc, clearly below slab => slab_deep)
 
-# Subduction zoning
-SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH = 70.0
-INTERFACE_DEPTH_TOL = 7.0
-FOREARC_MAX_DEPTH   = 70.0
-SLAB_ABOVE_MARGIN   = 5.0
+SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH = 70.0  # km
+INTERFACE_DEPTH_TOL    = 5.0     # km (3–5 km recommended)
+BACKARC_MAX_DEPTH      = 50.0    # km -> backarc requires depth < 50 km
 
-# Convergence (placeholder – mechanism checks relaxed)
-CONV_AZIMUTH_DEG = 78.0
-
-# Slab query
-SLAB_QUERY_MAXDIST_KM = 15.0
-SLAB_DEPTH_IS_POSITIVE_DOWN = True  # set False if your .xyz has negative depth for +down
+SLAB_QUERY_MAXDIST_KM  = 15.0    # nearest slab node must be within this distance
+SLAB_DEPTH_IS_POSITIVE_DOWN = False  # True if slab2 depth values are +down; set False to flip on load
 
 # ------------------ CLASSES ------------------
 CLASSES = [
     "crustal_intraarc_shallow",
     "crustal_intraarc_deep",
-    "subduction_interface",
-    "subduction_intraslab",
-    "deep_subduction",
+    "slab_interface",
+    "intra_slab",
+    "slab_deep",
     "outer_rise",
     "forearc",
-    "deep",            # intra-arc but beneath slab
+    "backarc",
     "unclassified",
 ]
 
-# ------------------ INPUTS (edit paths here) ------------------
+# ------------------ INPUTS ------------------
 PROCESSED_DIR = "processed_catalogs"
 INPUT_FILES: Dict[str, str] = {
-    "gcmt": os.path.join(PROCESSED_DIR, "gcmt_formatted.csv"),
-    "anss": os.path.join(PROCESSED_DIR, "anss_formatted.csv"),
-    "isc":  os.path.join(PROCESSED_DIR, "isc_formatted.csv"),
-    "isc_gem": os.path.join(PROCESSED_DIR, "isc_gem_formatted.csv"),
+    "gcmt":     os.path.join(PROCESSED_DIR, "gcmt_formatted.csv"),
+    "anss":     os.path.join(PROCESSED_DIR, "anss_formatted.csv"),
+    "isc":      os.path.join(PROCESSED_DIR, "isc_formatted.csv"),
+    "isc_gem":  os.path.join(PROCESSED_DIR, "isc_gem_formatted.csv"),
     "gmt_nico": os.path.join(PROCESSED_DIR, "gmt_nico_formatted.csv"),
-    "merged": os.path.join(PROCESSED_DIR, "merged_catalog.csv"),
-    "full":   os.path.join(PROCESSED_DIR, "full_catalog_with_dups.csv"),
+    "merged":   os.path.join(PROCESSED_DIR, "merged_catalog.csv"),
+    "full":     os.path.join(PROCESSED_DIR, "full_catalog_with_dups.csv"),
 }
 
 INTRA_ARC_SHP   = "../polygons/intraarc_polygon.shp"      # EPSG:4326
 TRENCH_LINE_SHP = "../shapefiles/chile_trench.shp"        # EPSG:4326
-SLAB_DEPTH_XYZ  = "../slab2/sam_slab2_dep_02.23.18.xyz"   # lon(0..360), lat, depth (+down if SLAB_DEPTH_IS_POSITIVE_DOWN)
+SLAB_DEPTH_XYZ  = "../slab2/sam_slab2_dep_02.23.18.xyz"   # lon(0..360), lat, depth (+down if flag True)
 SLAB_STRIKE_XYZ = "../slab2/sam_slab2_str_02.23.18.xyz"
 SLAB_DIP_XYZ    = "../slab2/sam_slab2_dip_02.23.18.xyz"
 
@@ -88,45 +93,29 @@ def haversine_km(lon1, lat1, lon2, lat2):
     a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return 2*R*math.asin(math.sqrt(a))
 
-def angdiff_line(a: float, b: float) -> float:
-    return abs(((a - b + 90.0) % 180.0) - 90.0)
-
-def slip_azimuth_from_sdr(strike_deg, dip_deg, rake_deg) -> Optional[float]:
-    if any(pd.isna(v) for v in [strike_deg, dip_deg, rake_deg]):
-        return None
-    strike = math.radians(float(strike_deg))
-    dip    = math.radians(float(dip_deg))
-    rake   = math.radians(float(rake_deg))
-    u_s = np.array([math.cos(strike), math.sin(strike), 0.0])
-    u_d = np.array([-math.cos(dip)*math.sin(strike), math.cos(dip)*math.cos(strike), -math.sin(dip)])
-    s_vec = math.cos(rake) * u_s + math.sin(rake) * u_d
-    sN, sE = float(s_vec[0]), float(s_vec[1])
-    if abs(sN) < 1e-12 and abs(sE) < 1e-12:
-        return None
-    return (math.degrees(math.atan2(sE, sN)) + 360.0) % 360.0
-
 # ------------------ slab grid ------------------
 @dataclass
 class SlabGrid:
     tree: cKDTree
     lon: np.ndarray
     lat: np.ndarray
-    depth: np.ndarray
-    strike: np.ndarray
-    dip: np.ndarray
+    depth: np.ndarray   # km, +down
+    strike: np.ndarray  # deg
+    dip: np.ndarray     # deg
+
+def _read_xyz(p):
+    arr = pd.read_csv(p, header=None, names=["lon","lat","val"])
+    arr["lon"] = arr["lon"].astype(float).apply(lon_0360_to_180)
+    arr["lat"] = arr["lat"].astype(float)
+    return arr
 
 def load_slab_xyz(depth_path: str, strike_path: str, dip_path: str) -> SlabGrid:
-    def read_xyz(p):
-        arr = pd.read_csv(p, header=None, names=["lon","lat","val"])
-        arr["lon"] = arr["lon"].astype(float).apply(lon_0360_to_180)
-        arr["lat"] = arr["lat"].astype(float)
-        return arr
+    dep = _read_xyz(depth_path)
+    st  = _read_xyz(strike_path)
+    di  = _read_xyz(dip_path)
 
-    dep = read_xyz(depth_path)
     if not SLAB_DEPTH_IS_POSITIVE_DOWN:
-        dep["val"] = -dep["val"]  # flip if files are negative for +down
-    st  = read_xyz(strike_path)
-    di  = read_xyz(dip_path)
+        dep["val"] = -dep["val"]
 
     merged = dep.merge(st, on=["lon","lat"], how="outer", suffixes=("_dep","_st"))
     merged = merged.merge(di, on=["lon","lat"], how="outer")
@@ -135,12 +124,11 @@ def load_slab_xyz(depth_path: str, strike_path: str, dip_path: str) -> SlabGrid:
 
     lon = merged["lon"].to_numpy(float)
     lat = merged["lat"].to_numpy(float)
-    depth = merged["val_dep"].to_numpy(float)
+    depth = merged["val_dep"].to_numpy(float)         # keep +down
     strike = merged["val_st"].to_numpy(float)
     dip = merged["val_dip"].to_numpy(float)
 
-    coords = np.c_[lon, lat]
-    tree = cKDTree(coords)
+    tree = cKDTree(np.c_[lon, lat])
     return SlabGrid(tree=tree, lon=lon, lat=lat, depth=depth, strike=strike, dip=dip)
 
 def query_slab(grid: SlabGrid, lon: float, lat: float, maxdist_km: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -165,44 +153,28 @@ def load_intra_arc_polygon(path: str):
     if not os.path.exists(path):
         return None
     gdf = gpd.read_file(path).to_crs(epsg=4326)
-    return gdf.unary_union
+    return unary_union(gdf.geometry)
 
 def load_trench_line(path: str):
     if not os.path.exists(path):
         return None
     gdf = gpd.read_file(path).to_crs(epsg=4326)
-    return gdf.unary_union
+    return unary_union(gdf.geometry)
 
 def is_west_of_trench(lon: float, lat: float, trench_line) -> bool:
     if trench_line is None or np.isnan(lon) or np.isnan(lat):
         return False
     pt = Point(lon, lat)
     nearest = trench_line.interpolate(trench_line.project(pt))
-    return float(lon) < float(nearest.x)
+    return float(lon) < float(nearest.x)  # further west = more negative lon
 
-# ------------------ placeholder mechanism test ------------------
-def nodal_plane_matches_interface(strike: float, dip: float, rake: float,
-                                  slab_strike: Optional[float], slab_dip: Optional[float],
-                                  p_azimuth: Optional[float]) -> bool:
-    """
-    Placeholder: returns True (mechanism filters disabled for now).
-    Keep function shape so we can tighten it later.
-    """
-    # saz = slip_azimuth_from_sdr(strike, dip, rake)
-    # if saz is None or angdiff_line(saz, CONV_AZIMUTH_DEG) > 45.0: return False
-    # (other tests off)
-    return True
-
-def is_interface_mechanism(row, slab_strike: Optional[float], slab_dip: Optional[float]) -> bool:
-    s1, d1, r1 = row.get("strike1"), row.get("dip1"), row.get("rake1")
-    s2, d2, r2 = row.get("strike2"), row.get("dip2"), row.get("rake2")
-    p_az = row.get("P_azimuth")
-    ok1 = (s1 is not None and d1 is not None and r1 is not None) and \
-          nodal_plane_matches_interface(s1, d1, r1, slab_strike, slab_dip, p_az)
-    if ok1: return True
-    ok2 = (s2 is not None and d2 is not None and r2 is not None) and \
-          nodal_plane_matches_interface(s2, d2, r2, slab_strike, slab_dip, p_az)
-    return bool(ok2)
+def is_east_of_polygon(lon: float, lat: float, polygon) -> bool:
+    if polygon is None or np.isnan(lon) or np.isnan(lat):
+        return False
+    boundary = polygon.boundary
+    pt = Point(lon, lat)
+    nearest = boundary.interpolate(boundary.project(pt))
+    return float(lon) > float(nearest.x)
 
 # ------------------ classification ------------------
 def classify_row(row, intra_poly, trench_line, slab: SlabGrid) -> str:
@@ -212,58 +184,50 @@ def classify_row(row, intra_poly, trench_line, slab: SlabGrid) -> str:
 
     slab_depth, slab_strike, slab_dip = query_slab(slab, lon, lat, SLAB_QUERY_MAXDIST_KM)
 
+    # 1) Inside intra-arc polygon
     in_intra = False
     if intra_poly is not None and not (np.isnan(lon) or np.isnan(lat)):
         in_intra = intra_poly.contains(Point(lon, lat))
 
-    west_of_tr = is_west_of_trench(lon, lat, trench_line)
-
-    # 1) Outer-rise
-    if west_of_tr:
-        return "outer_rise"
-
-    # 2) Intra-arc shallow
-    if in_intra and not np.isnan(dep) and dep <= INTRA_ARC_SHALLOW_MAX:
-        return "crustal_intraarc_shallow"
-
-    # 3) Slab-defined logic
-    if slab_depth is not None and not np.isnan(dep):
-        if slab_depth <= SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH:
-            depth_diff = abs(dep - slab_depth)
-
-            # interface
-            if depth_diff <= INTERFACE_DEPTH_TOL and is_interface_mechanism(row, slab_strike, slab_dip):
-                return "subduction_interface"
-
-            # intraslab
-            if dep >= slab_depth + INTERFACE_DEPTH_TOL:
-                return "subduction_intraslab"
-
-            # forearc (above slab and shallow, not intra-arc)
-            if (dep <= slab_depth - SLAB_ABOVE_MARGIN) and (dep <= FOREARC_MAX_DEPTH) and (not in_intra):
-                return "forearc"
-
-            # intra-arc deep (above slab but deeper than shallow threshold)
-            if in_intra and (dep > INTRA_ARC_SHALLOW_MAX) and (dep <= slab_depth + INTRA_ARC_DEEP_MARGIN):
+    if in_intra and not np.isnan(dep):
+        if slab_depth is None:
+            # new rule: tiered by depth
+            if dep <= INTRA_ARC_SHALLOW_MAX:
+                return "crustal_intraarc_shallow"
+            elif dep <= 90.0:
+                return "crustal_intraarc_deep"
+            else:
+                return "slab_deep"
+        else:
+            # slab is available
+            if dep >= slab_depth - DEEP_SLAB_TOL:
+                return "slab_deep"
+            if dep <= INTRA_ARC_SHALLOW_MAX:
+                return "crustal_intraarc_shallow"
+            else:
                 return "crustal_intraarc_deep"
 
-            # intra-arc but beneath slab
-            if in_intra and (dep >= slab_depth + INTERFACE_DEPTH_TOL):
-                return "deep"
+    # 2) WEST (oceanward) of trench -> outer_rise
+    if is_west_of_trench(lon, lat, trench_line):
+        return "outer_rise"
 
+    # 3) EAST of intra-arc polygon AND shallow (< 50 km) -> backarc
+    if (not in_intra) and is_east_of_polygon(lon, lat, intra_poly) and (not np.isnan(dep)) and (dep < BACKARC_MAX_DEPTH):
+        return "backarc"
+
+    # 4) Subduction domain (slab defined)
+    if (slab_depth is not None) and (not np.isnan(dep)):
+        if slab_depth <= SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH:
+            if dep <= slab_depth - INTERFACE_DEPTH_TOL:
+                return "forearc"
+            elif abs(dep - slab_depth) <= INTERFACE_DEPTH_TOL:
+                return "slab_interface"
+            elif dep >= slab_depth + INTERFACE_DEPTH_TOL:
+                return "intra_slab"
         else:
-            # deep subduction domain
-            if (abs(dep - slab_depth) <= INTERFACE_DEPTH_TOL) or (dep >= slab_depth - INTERFACE_DEPTH_TOL):
-                return "deep_subduction"
+            return "slab_deep"
 
-    # 4) Intra-arc deep (no slab or outside shallow domain)
-    if in_intra and not np.isnan(dep) and dep > INTRA_ARC_SHALLOW_MAX:
-        return "crustal_intraarc_deep"
-
-    # 5) Forearc shallow (no slab info)
-    if not in_intra and not np.isnan(dep) and dep <= FOREARC_MAX_DEPTH:
-        return "forearc"
-
+    # 5) Fallback
     return "unclassified"
 
 # ------------------ run on one CSV ------------------
@@ -272,25 +236,19 @@ def classify_catalog(csv_path: str, out_folder: str,
     os.makedirs(out_folder, exist_ok=True)
     df = pd.read_csv(csv_path)
 
-    # normalize numeric columns if present
     for col in ["longitude","latitude","depth","strike1","dip1","rake1","strike2","dip2","rake2",
                 "T_plunge","T_azimuth","N_plunge","N_azimuth","P_plunge","P_azimuth",
                 "Mrr","Mtt","Mpp","Mrt","Mrp","Mtp"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    labels = []
-    for _, row in df.iterrows():
-        labels.append(classify_row(row, intra_poly, trench_line, slab))
-    df["class"] = labels
+    df["class"] = [classify_row(row, intra_poly, trench_line, slab) for _, row in df.iterrows()]
 
-    # write combined
     base_name = os.path.splitext(os.path.basename(csv_path))[0]
     combined_path = os.path.join(out_folder, f"{base_name}_classified.csv")
     df.to_csv(combined_path, index=False)
     print(f"[OK] {combined_path}  ({len(df)} rows)")
 
-    # write per-class
     for cls in CLASSES:
         sub = df[df["class"] == cls].copy()
         sub_path = os.path.join(out_folder, f"{cls}.csv")
@@ -300,12 +258,10 @@ def classify_catalog(csv_path: str, out_folder: str,
 def main():
     os.makedirs(OUT_ROOT, exist_ok=True)
 
-    # load spatial data (once)
     intra_poly = load_intra_arc_polygon(INTRA_ARC_SHP)
     trench_line = load_trench_line(TRENCH_LINE_SHP)
     slab = load_slab_xyz(SLAB_DEPTH_XYZ, SLAB_STRIKE_XYZ, SLAB_DIP_XYZ)
 
-    # classify each catalog into its own subfolder
     for name, path in INPUT_FILES.items():
         if not os.path.exists(path):
             print(f"[skip] not found: {path}")

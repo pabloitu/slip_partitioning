@@ -1,1 +1,2 @@
 id,time_iso,longitude,latitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,dups,class
+202408261621A,2024-08-26T16:21:00,-73.85,-44.93,72.0,5.1,mw,235.0,46.0,10.0,138.0,83.0,135.0,37.0,87.0,39.0,320.0,30.0,202.0,4439000000000000.0,-2.8239e+16,2.3801e+16,1.9251e+16,-2.8364e+16,9922000000000000.0,gmt,gcmt:C202408261621A;us:6000nmw5,unclassified

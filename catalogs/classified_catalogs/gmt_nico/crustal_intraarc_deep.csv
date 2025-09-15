@@ -1,3 +1,6 @@
 id,time_iso,latitude,longitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,P_plunge,P_azimuth,N_plunge,N_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,class
 200701280253A,2007-01-28T02:53:00,-45.39,-73.69,47,5.2,mw,104,76,1,14,89,166,11,328,9,60,,,,,,,,,gmt,crustal_intraarc_deep
-202408261621A,2024-08-26T16:21:00,-44.93,-73.85,72,5.1,mw,235,46,10,138,83,135,35,86,24,195,,,,,,,,,gmt,crustal_intraarc_deep
+200903111306A,2009-03-11T13:06:00,-31.98,-69.29,37,5.3,mw,190,44,109,344,49,72,77,187,3,87,,,,,,,,,gmt,crustal_intraarc_deep
+201910280355A,2019-10-28T03:55:00,-30.25,-68.97,39,5.1,mw,59,39,145,178,69,57,54,46,17,292,,,,,,,,,gmt,crustal_intraarc_deep
+031196C,,-42.34,-71.45,134,5.3,mw,208,13,40,79,82,100,52,0,36,160,,,,,,,,,gmt,crustal_intraarc_deep
+081496F,,-42.36,-72.81,33,5.2,mw,215,29,-11,314,85,-119,34,69,43,197,,,,,,,,,gmt,crustal_intraarc_deep

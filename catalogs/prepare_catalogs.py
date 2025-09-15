@@ -34,9 +34,8 @@ import numpy as np
 import pandas as pd
 from obspy import read_events
 from libcomcat.search import get_event_by_id
-
 # ---------------- GLOBAL FILTERS (EDIT HERE) ----------------
-LAT_MIN, LAT_MAX = -54.0, -17.0
+LAT_MIN, LAT_MAX = -51.0, -27.0
 LON_MIN, LON_MAX = -80.0, -65.0
 TIME_MIN_STR = "1976-01-01T00:00:00"
 MAG_MIN = 4.95
