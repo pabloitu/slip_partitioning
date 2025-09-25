@@ -1,0 +1,18 @@
+name: slip_partitioning
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python = 3.11
+  - numpy
+  - pycsep
+  - obspy
+  - pandas
+  - geopandas
+  - matplotlib
+  - rasterio
+  - scipy
+  - shapely
+  - seaborn
+  - pip:
+      - git+https://code.usgs.gov/ghsc/esi/libcomcat-python.git@main
