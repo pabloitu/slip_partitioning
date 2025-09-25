@@ -1,2 +1,0 @@
-id,time_iso,latitude,longitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,P_plunge,P_azimuth,N_plunge,N_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,class
-202408261621A,2024-08-26T16:21:00,-44.93,-73.85,72,5.1,mw,235,46,10,138,83,135,35,86,24,195,,,,,,,,,gmt,unclassified

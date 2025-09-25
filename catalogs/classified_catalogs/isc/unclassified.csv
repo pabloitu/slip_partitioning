@@ -1,2 +1,0 @@
-id,time_iso,longitude,latitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,class
-610654892,2017-05-27T07:38:41,-75.6269,-45.7378,10.0,5.1,mw,96.97,48.91,-137.03,335.5,59.09,-50.0,6.0,38.0,33.0,132.0,56.0,300.0,-3942000000.0,3114000000.0,829000000.0,-842000000.0,-2683000000.0,-3645000000.0,NEIC,unclassified

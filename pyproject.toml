@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=52.0", "wheel", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+addopts = "--cov=floatcsep"
+norecursedirs = ["tutorials", "tests/artifacts"]
+testpaths = [
+    "tests",
+]
+
+[tool.black]
+line-length = 96
+skip-string-normalization = false
+target-version = ["py39", "py310", "py311"]
+
+[tool.flake8]
+ignore = ["E203", "W503", "F401"]
+max-line-length = 96
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "no-local-version"
+fallback_version = "0.2.0"

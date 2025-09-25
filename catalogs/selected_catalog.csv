@@ -1,3 +1,0 @@
-id,time_iso,longitude,latitude,depth,mag,mag_type,strike1,dip1,rake1,strike2,dip2,rake2,T_plunge,T_azimuth,N_plunge,N_azimuth,P_plunge,P_azimuth,Mrr,Mtt,Mpp,Mrt,Mrp,Mtp,source,dups,class
-201102210538A,2011-02-21T05:38:00,-72.55,-46.02,18.0,5.0,mw,271.0,32.0,-20.0,18.0,79.0,-121.0,28.0,132.0,30.0,24.0,47.0,256.0,-1.51e+16,1.94e+16,-4400000000000000.0,900000000000000.0,-3.72e+16,1.59e+16,gmt,us:pde20110221053851050_36;gem:16168884,crustal_intraarc_shallow
-200704020249A,2007-04-02T02:49:00,-73.04,-45.41,30.0,6.2,mw,53.0,43.0,-86.0,228.0,47.0,-94.0,2.0,321.0,3.0,231.0,86.0,93.0,-1.59e+18,1.14e+18,4.5e+17,1.15e+17,1.32e+17,1.71e+18,gmt,gcmt:C200704020249A;gcmt:C200704020249A;us:C200704020249A;gem:11912922,crustal_intraarc_shallow
