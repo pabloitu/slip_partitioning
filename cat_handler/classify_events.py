@@ -18,8 +18,8 @@ from cat_handler import paths
 INTRA_ARC_SHALLOW_MAX = 32.0
 DEEP_SLAB_TOL = 10.0
 SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH = 70.0
-INTERFACE_DEPTH_TOL = 7.0            # buffer for relocated or “no-error-info” cases
-STRICT_INTERFACE_DEPTH_TOL = 12.0    # treat explicit 0 depth_error as poorly constrained
+INTERFACE_DEPTH_TOL = 10.0            # buffer for relocated or “no-error-info” cases
+STRICT_INTERFACE_DEPTH_TOL = 15.0    # treat explicit 0 depth_error as poorly constrained
 BACKARC_MAX_DEPTH = 50.0
 SLAB_QUERY_MAXDIST_KM = 15.0
 SLAB_DEPTH_IS_POSITIVE_DOWN = False
