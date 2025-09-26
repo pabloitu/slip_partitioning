@@ -15,7 +15,7 @@ from scipy.spatial import cKDTree
 from cat_handler import paths
 
 # ---- Tunables ----
-INTRA_ARC_SHALLOW_MAX = 32.0
+INTRA_ARC_SHALLOW_MAX = 40.0
 DEEP_SLAB_TOL = 10.0
 SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH = 70.0
 INTERFACE_DEPTH_TOL = 10.0            # buffer for relocated or “no-error-info” cases
