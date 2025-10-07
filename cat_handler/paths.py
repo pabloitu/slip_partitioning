@@ -52,7 +52,7 @@ for d in (RESULTS, FIGURES, FORMATTED_CATALOGS, MERGED_CATALOGS, CLASSIFIED_CATA
 # Processed Catalogs
 cat_anss = FORMATTED_CATALOGS / "anss.csv"
 cat_gcmt_perez = FORMATTED_CATALOGS / "gcmt_perez.csv"
-cat_gcmt = FORMATTED_CATALOGS / "gcmt.txt"
+cat_gcmt = FORMATTED_CATALOGS / "gcmt.csv"
 cat_isc = FORMATTED_CATALOGS / "isc.txt"
 cat_isc_gem = FORMATTED_CATALOGS / "isc_gem.csv"
 cat_potin = FORMATTED_CATALOGS / "potin.csv"

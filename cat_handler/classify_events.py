@@ -16,20 +16,20 @@ from cat_handler import paths
 
 # ---- Tunables ----
 INTRA_ARC_SHALLOW_MAX = 40.0
-DEEP_SLAB_TOL = 10.0
+DEEP_SLAB_TOL = 15.0
 SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH = 70.0
-INTERFACE_DEPTH_TOL = 10.0            # buffer for relocated or “no-error-info” cases
+INTERFACE_DEPTH_TOL = 7.5            # buffer for relocated or “no-error-info” cases
 STRICT_INTERFACE_DEPTH_TOL = 15.0    # treat explicit 0 depth_error as poorly constrained
-BACKARC_MAX_DEPTH = 50.0
+BACKARC_MAX_DEPTH = 70
 SLAB_QUERY_MAXDIST_KM = 15.0
 SLAB_DEPTH_IS_POSITIVE_DOWN = False
 CONV_AZIMUTH_DEG = 78.0
 NORM_CONE_DEG = 35.0
-SLIP_CONE_DEG = 70.0
+SLIP_CONE_DEG = 90.0
 
 CLASSES = [
-    "crustal_intraarc_shallow",
-    "crustal_intraarc_deep",
+    "intraarc_shallow",
+    "intraarc_deep",
     "slab_interface",
     "intra_slab",
     "slab_deep",
@@ -132,37 +132,81 @@ def _angle_between(a: np.ndarray, b: np.ndarray, oriented: bool=False) -> float:
     if not oriented:
         dot = abs(dot)
     return math.degrees(math.acos(_clamp(dot)))
+# ---- Focal-mechanism cones (ENU-consistent) ----
+import math
+import numpy as np
+
+def _deg2rad(x: float) -> float:
+    return math.radians(float(x))
+
+def _clamp(x: float) -> float:
+    return max(-1.0, min(1.0, float(x)))
+
+def _angle_between(a: np.ndarray, b: np.ndarray, oriented: bool = False) -> float:
+    """Angle (deg) between vectors a and b. If oriented=False, uses |dot| (0..90 symmetry)."""
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na < 1e-12 or nb < 1e-12:
+        return float('nan')
+    a = a / na; b = b / nb
+    dot = float(np.dot(a, b))
+    if not oriented:
+        dot = abs(dot)
+    return math.degrees(math.acos(_clamp(dot)))
 
 def _strike_dip_axes(strike_deg: float, dip_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    st = _deg2rad(strike_deg); di = _deg2rad(dip_deg)
-    u_s = np.array([ math.cos(st),  math.sin(st), 0.0 ])
-    u_d = np.array([-math.cos(di)*math.sin(st),
-                     math.cos(di)*math.cos(st),
-                    -math.sin(di)])
-    n = np.cross(u_s, u_d)
-    for v in (u_s, u_d, n):
+    """
+    ENU coordinates: X=East, Y=North, Z=Up.
+    strike: azimuth clockwise from North (0..360).
+    dip: angle from horizontal (0..90), dipping to right of strike.
+
+    Returns:
+      u_s : unit along-strike (horizontal, ENU)
+      u_d : unit down-dip   (tilted downward; negative Up component)
+      n   : unit plane normal, chosen upward (positive Up where possible)
+    """
+    th = _deg2rad(strike_deg)
+    di = _deg2rad(dip_deg)
+
+    # Along-strike: horizontal direction (east, north, up)
+    u_s = np.array([math.sin(th), math.cos(th), 0.0], dtype=float)
+
+    # Down-dip: strike+90° direction in map, tilted down by dip
+    u_d = np.array([
+        math.cos(th) * math.cos(di),   # East
+       -math.sin(th) * math.cos(di),   # North
+       -math.sin(di)                   # Up (negative = downward)
+    ], dtype=float)
+
+    # Upward-pointing plane normal (right-hand: u_d × u_s)
+    n = np.cross(u_d, u_s)
+
+    # Normalize
+    def _unit(v):
         nv = np.linalg.norm(v)
-        if nv > 0: v[:] = v / nv
+        return v / nv if nv > 0 else v
+    u_s = _unit(u_s); u_d = _unit(u_d); n = _unit(n)
     return u_s, u_d, n
 
 def _plane_normal(strike_deg: float, dip_deg: float) -> np.ndarray:
     _, _, n = _strike_dip_axes(strike_deg, dip_deg)
     return n
 
-def _slip_vector(strike_deg: float, dip_deg: float, rake_deg: float) -> Optional[np.ndarray]:
-    if any(pd.isna(v) for v in (strike_deg, dip_deg, rake_deg)):
-        return None
+def _slip_vector(strike_deg: float, dip_deg: float, rake_deg: float) -> np.ndarray:
+    """Unit slip vector in ENU; rake measured in the fault plane from strike toward down-dip."""
     u_s, u_d, _ = _strike_dip_axes(strike_deg, dip_deg)
     ra = _deg2rad(rake_deg)
-    v = math.cos(ra)*u_s + math.sin(ra)*u_d
+    v = math.cos(ra) * u_s + math.sin(ra) * u_d
     nv = np.linalg.norm(v)
-    if nv < 1e-12:
-        return None
-    return v / nv
+    return v / nv if nv > 0 else v
 
-def _expected_slip_on_plane(strike_deg: float, dip_deg: float, conv_az_deg: float) -> Optional[np.ndarray]:
+def _expected_slip_on_plane(strike_deg: float, dip_deg: float, conv_az_deg: float) -> np.ndarray | None:
+    """
+    Project far-field convergence azimuth (horizontal) onto the fault plane.
+    conv_az_deg: azimuth clockwise from North.
+    """
     az = _deg2rad(conv_az_deg)
-    v_conv = np.array([math.cos(az), math.sin(az), 0.0])
+    v_conv = np.array([math.sin(az), math.cos(az), 0.0], dtype=float)  # ENU
     n = _plane_normal(strike_deg, dip_deg)
     v_proj = v_conv - np.dot(v_conv, n) * n
     nv = np.linalg.norm(v_proj)
@@ -171,24 +215,30 @@ def _expected_slip_on_plane(strike_deg: float, dip_deg: float, conv_az_deg: floa
     return v_proj / nv
 
 def _geom_cone_ok(strike: float, dip: float, slab_strike: float, slab_dip: float, norm_cone_deg: float) -> bool:
+    """Normal-vs-normal cone test (unoriented, i.e., 0..90 symmetry)."""
     if any(pd.isna(v) for v in (strike, dip, slab_strike, slab_dip)):
         return False
-    ang = _angle_between(_plane_normal(strike, dip), _plane_normal(slab_strike, slab_dip), oriented=False)
+    n_ev = _plane_normal(strike, dip)
+    n_sl = _plane_normal(slab_strike, slab_dip)
+    ang = _angle_between(n_ev, n_sl, oriented=False)
     return ang <= float(norm_cone_deg)
 
 def _slip_cone_ok(strike: float, dip: float, rake: float, conv_az_deg: float, slip_cone_deg: float) -> bool:
+    """Slip-vs-convergence (projected) cone test (oriented: do not abs(dot))."""
     s_obs = _slip_vector(strike, dip, rake)
     s_exp = _expected_slip_on_plane(strike, dip, conv_az_deg)
-    if (s_obs is None) or (s_exp is None):
+    if s_exp is None:
         return False
     ang = _angle_between(s_obs, s_exp, oriented=True)
     return ang <= float(slip_cone_deg)
 
 def interface_mech_ok_cone(row: pd.Series,
                            slab_strike: float, slab_dip: float,
-                           conv_az_deg: float = CONV_AZIMUTH_DEG,
-                           norm_cone_deg: float = NORM_CONE_DEG,
-                           slip_cone_deg: float = SLIP_CONE_DEG) -> bool:
+                           conv_az_deg: float,
+                           norm_cone_deg: float,
+                           slip_cone_deg: float,
+                           id_: str | None = None) -> bool:
+    """True if EITHER nodal plane passes the normal-cone AND slip-cone tests."""
     s1, d1, r1 = row.get("strike1"), row.get("dip1"), row.get("rake1")
     s2, d2, r2 = row.get("strike2"), row.get("dip2"), row.get("rake2")
 
@@ -196,9 +246,31 @@ def interface_mech_ok_cone(row: pd.Series,
     if all(v is not None and not pd.isna(v) for v in (s1, d1, r1)):
         ok |= (_geom_cone_ok(s1, d1, slab_strike, slab_dip, norm_cone_deg)
                and _slip_cone_ok(s1, d1, r1, conv_az_deg, slip_cone_deg))
+        if id_ == '6000g836':
+            print('first', _geom_cone_ok(s1, d1, slab_strike, slab_dip, norm_cone_deg),  _slip_cone_ok(s1, d1, r1, conv_az_deg, slip_cone_deg))
+
+            s_obs = _slip_vector(s1, d1, r1)
+            print(s1, d1, r1, s_obs)
+            s_exp = _expected_slip_on_plane(slab_strike, slab_dip, conv_az_deg)
+            print(slab_strike, slab_dip, conv_az_deg, s_exp)
+            # if s_exp is None:
+                # return False
+            ang = _angle_between(s_obs, s_exp, oriented=True)
+            print(ang)
+            # return ang <= float(slip_cone_deg)
     if all(v is not None and not pd.isna(v) for v in (s2, d2, r2)):
         ok |= (_geom_cone_ok(s2, d2, slab_strike, slab_dip, norm_cone_deg)
                and _slip_cone_ok(s2, d2, r2, conv_az_deg, slip_cone_deg))
+        if id_ == '6000g836':
+            print('second', _geom_cone_ok(s2, d2, slab_strike, slab_dip, norm_cone_deg),  _slip_cone_ok(s2, d2, r2, conv_az_deg, slip_cone_deg))
+            s_obs = _slip_vector(s2, d2, r2)
+            print(s2, d2, r2, s_obs)
+            s_exp = _expected_slip_on_plane(slab_strike, slab_dip, conv_az_deg)
+            print(slab_strike, slab_dip, conv_az_deg, s_exp)
+            # if s_exp is None:
+                # return False
+            ang = _angle_between(s_obs, s_exp, oriented=True)
+            print(ang)
     return bool(ok)
 
 # ---- Depth-based logic helpers ----
@@ -229,6 +301,7 @@ def classify_row(row: pd.Series, intra_poly, trench_line, slab: SlabGrid) -> tup
     lon = pd.to_numeric(pd.Series([row.get("longitude")]), errors="coerce").iloc[0]
     lat = pd.to_numeric(pd.Series([row.get("latitude")]),  errors="coerce").iloc[0]
     dep = pd.to_numeric(pd.Series([row.get("depth")]),     errors="coerce").iloc[0]
+    id_ = row.get("id")
     lon = float(lon) if pd.notna(lon) else np.nan
     lat = float(lat) if pd.notna(lat) else np.nan
     dep = float(dep) if pd.notna(dep) else np.nan
@@ -240,60 +313,78 @@ def classify_row(row: pd.Series, intra_poly, trench_line, slab: SlabGrid) -> tup
                 and intra_poly.contains(Point(lon, lat)))
     if in_intra and np.isfinite(dep):
         if slab_depth is None:
-            if dep <= INTRA_ARC_SHALLOW_MAX: return "crustal_intraarc_shallow", np.nan
-            if dep <= 90.0:                  return "crustal_intraarc_deep",   np.nan
+            if dep <= INTRA_ARC_SHALLOW_MAX: return "intraarc_shallow", np.nan
+            if dep <= 90.0:                  return "intraarc_deep",   np.nan
             return "slab_deep", np.nan
         else:
             if dep >= slab_depth - DEEP_SLAB_TOL: return "slab_deep", slab_depth
-            if dep <= INTRA_ARC_SHALLOW_MAX:      return "crustal_intraarc_shallow", np.nan
-            return "crustal_intraarc_deep", np.nan
+            if dep <= INTRA_ARC_SHALLOW_MAX:      return "intraarc_shallow", np.nan
+            return "intraarc_deep", np.nan
 
     if is_west_of_trench(lon, lat, trench_line): return "outer_rise", np.nan
     if (not in_intra) and is_east_of_polygon(lon, lat, intra_poly) and np.isfinite(dep) and dep < BACKARC_MAX_DEPTH:
         return "backarc", np.nan
 
     if (slab_depth is None) or (not np.isfinite(dep)): return "unclassified", np.nan
-    if slab_depth > SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH: return "slab_deep", slab_depth
 
     # ---- DEPTH-FIRST classification in subduction domain ----
     relocated = _is_relocated(row)
     lon_err, lat_err, dep_err = _numeric_errors(row)
 
-    # 1) Relocated → strict small buffer
-    if relocated:
-        if dep <= slab_depth - INTERFACE_DEPTH_TOL: return "forearc", slab_depth
-        if dep >= slab_depth + INTERFACE_DEPTH_TOL: return "intra_slab", slab_depth
-        # ambiguous (inside buffer) → go to kinematics
+    if slab_depth < SUBDUCTION_CLASSIFY_MAX_SLAB_DEPTH:
 
-    else:
-        # 2) Numeric errors → ellipse sampling of slab depths
-        if np.isfinite(dep_err) and dep_err > 0:
-            mask = _ellipse_mask(slab.lon, slab.lat, lon, lat, lon_err, lat_err)
-            if mask.any():
-                min_slab = float(np.nanmin(slab.depth[mask]))
-                max_slab = float(np.nanmax(slab.depth[mask]))
-                if np.isfinite(min_slab) and (dep + dep_err < min_slab): return "forearc", slab_depth
-                if np.isfinite(max_slab) and (dep - dep_err > max_slab): return "intra_slab", slab_depth
-            # ambiguous → continue to kinematics
-
-        # 3) Explicit zero error → poorly constrained → strict buffer
-        elif np.isfinite(dep_err) and dep_err == 0.0:
-            if dep <= slab_depth - STRICT_INTERFACE_DEPTH_TOL: return "forearc", slab_depth
-            if dep >= slab_depth + STRICT_INTERFACE_DEPTH_TOL: return "intra_slab", slab_depth
-            # ambiguous → continue to kinematics
-
-        # 4) No error info at all → default depth gate
-        else:
+        # 1) Relocated → strict small buffer
+        if relocated:
             if dep <= slab_depth - INTERFACE_DEPTH_TOL: return "forearc", slab_depth
             if dep >= slab_depth + INTERFACE_DEPTH_TOL: return "intra_slab", slab_depth
-            # ambiguous → continue to kinematics
+            # ambiguous (inside buffer) → go to kinematics
 
-    # ---- ONLY ambiguous events in the buffer reach kinematics ----
-    if interface_mech_ok_cone(row, slab_strike=slab_strike, slab_dip=slab_dip,
-                              conv_az_deg=CONV_AZIMUTH_DEG,
-                              norm_cone_deg=NORM_CONE_DEG,
-                              slip_cone_deg=SLIP_CONE_DEG):
-        return "slab_interface", slab_depth
+        else:
+            # 2) Numeric errors → ellipse sampling of slab depths
+            # print(id_)
+
+            if np.isfinite(dep_err) and dep_err > 0:
+                mask = _ellipse_mask(slab.lon, slab.lat, lon, lat, lon_err, lat_err)
+
+                if mask.any():
+                    min_slab = float(np.nanmin(slab.depth[mask]))
+                    max_slab = float(np.nanmax(slab.depth[mask]))
+                else:
+                    # Fallback: if ellipse hits nothing, use the nearest-node depth we already queried
+                    min_slab = max_slab = float(slab_depth) if slab_depth is not None else np.nan
+
+                # Only do the depth gates if we actually have slab values
+                if np.isfinite(min_slab) and (dep + dep_err < min_slab - INTERFACE_DEPTH_TOL):
+                    return "forearc", slab_depth
+                if np.isfinite(max_slab) and (dep - dep_err > max_slab + INTERFACE_DEPTH_TOL):
+                    return "intra_slab", slab_depth
+
+
+            # 3) Explicit zero error → poorly constrained → strict buffer
+            elif np.isfinite(dep_err) and dep_err == 0.0:
+                if dep <= slab_depth - STRICT_INTERFACE_DEPTH_TOL: return "forearc", slab_depth
+                if dep >= slab_depth + STRICT_INTERFACE_DEPTH_TOL: return "intra_slab", slab_depth
+                # ambiguous → continue to kinematics
+
+            # 4) No error info at all → default depth gate
+            else:
+                if dep <= slab_depth - STRICT_INTERFACE_DEPTH_TOL: return "forearc", slab_depth
+                if dep >= slab_depth + STRICT_INTERFACE_DEPTH_TOL: return "intra_slab", slab_depth
+                # ambiguous → continue to kinematics
+
+        # ---- ONLY ambiguous events in the buffer reach kinematics ----
+        if id_ == 'C201003071836A':
+            print('going_right')
+        if interface_mech_ok_cone(row, slab_strike=slab_strike, slab_dip=slab_dip,
+                                  conv_az_deg=CONV_AZIMUTH_DEG,
+                                  norm_cone_deg=NORM_CONE_DEG,
+                                  slip_cone_deg=SLIP_CONE_DEG, id_=id_):
+            return "slab_interface", slab_depth
+
+    else:
+        if dep >= slab_depth - DEEP_SLAB_TOL: return "slab_deep", slab_depth
+        if dep < slab_depth - DEEP_SLAB_TOL: return "forearc", slab_depth
+
     return ("forearc" if dep < slab_depth else "intra_slab"), slab_depth
 
 # ---- Catalog driver ----
@@ -348,4 +439,28 @@ def main() -> None:
         slab=slab,
     )
 if __name__ == "__main__":
+
+
     main()
+    # ----------------- quick ENU sanity tests -----------------
+    def pr(v): return np.round(v, 6)
+
+    # tests = [
+    #     # (strike, dip, rake, label)
+    #     (0,   0,   0,   "Strike N-S, horiz plane; rake 0 (along strike north)"),
+    #     (0,   45,  90,  "Strike N-S, dip 45E; pure dip-slip"),
+    #     (90,  30,  90,  "Strike E-W, dip 30S; pure dip-slip"),
+    #     (45,  60,  0,   "Strike NE-SW, dip 60; strike-slip"),
+    #     (210, 20,  120, "Oblique"),
+    # ]
+    # print("\n[ENU checks] strike,dip,rake  -> u_s, u_d, n, slip; angles")
+    # for (st, di, ra, lab) in tests:
+    #     u_s, u_d, n = _strike_dip_axes(st, di)
+    #     s_vec = _slip_vector(st, di, ra)
+    #     exp   = _expected_slip_on_plane(st, di, CONV_AZIMUTH_DEG)
+    #     ang_ns = _angle_between(n, _plane_normal(st, di), oriented=False)  # should be 0
+    #     ang_se = np.nan if exp is None else _angle_between(s_vec, exp, oriented=True)
+    #     print(f"{lab}\n  (st,di,ra)=({st},{di},{ra})"
+    #           f"\n  u_s={pr(u_s)}  u_d={pr(u_d)}  n={pr(n)}"
+    #           f"\n  slip={pr(s_vec)}  exp={pr(exp) if exp is not None else None}"
+    #           f"\n  angle(n,n)={ang_ns:.2f}°  angle(slip,exp)={ang_se:.2f}°\n")

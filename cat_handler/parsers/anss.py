@@ -23,7 +23,7 @@ from cat_handler.parsers.tools import (
 )
 
 # -------------------- CONFIG --------------------
-LAT_MIN, LAT_MAX = -51.0, -27.0
+LAT_MIN, LAT_MAX = -51.0, -31.0
 LON_MIN, LON_MAX = -80.0, -65.0
 TIME_MIN = pd.to_datetime("1976-01-01T00:00:00", utc=True)
 MAG_MIN = 4.95
@@ -64,7 +64,7 @@ UNQUERYABLE_EARTHQUAKES: List[Dict[str, Any]] = [
         time_iso="1985-03-03T22:47:26",
         longitude=-71.62,
         latitude=-33.12,
-        depth=33.0,
+        depth=40.0,
         mag=8.0,
         mag_type="mw",
         lon_error=None,

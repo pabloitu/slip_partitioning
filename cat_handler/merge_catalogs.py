@@ -16,6 +16,31 @@ FIELDS: List[str] = [
 
 MOMENT_FIELDS = ("Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp")
 SDR_FIELDS    = ("strike1", "dip1", "rake1", "strike2", "dip2", "rake2")
+# --- defaults you may extend later ---
+DEFAULT_DEPTHS = {33.0}  # add more if you find them
+_ATOL = 1e-6
+
+def _is_default_depth(x) -> bool:
+    try:
+        xv = float(x)
+    except Exception:
+        return False
+    return any(abs(xv - d) <= _ATOL for d in DEFAULT_DEPTHS)
+
+# One known default mechanism; append more tuples if you discover them
+_DEFAULT_MECHS = [(0.0, 45.0, 90.0, 180.0, 45.0, 90.0)]
+
+def _is_default_mech(rec: dict) -> bool:
+    try:
+        s1, d1, r1, s2, d2, r2 = (float(rec.get(k)) for k in SDR_FIELDS)
+    except Exception:
+        return False
+    def n(a): return (a % 360.0)
+    for S1, D1, R1, S2, D2, R2 in _DEFAULT_MECHS:
+        if (abs(n(s1)-n(S1))<=_ATOL and abs(d1-D1)<=_ATOL and abs(r1-R1)<=_ATOL and
+            abs(n(s2)-n(S2))<=_ATOL and abs(d2-D2)<=_ATOL and abs(r2-R2)<=_ATOL):
+            return True
+    return False
 
 CANON_SOURCE: Dict[str, str] = {
     "gcmt": "gcmt", "cmt": "gcmt",
@@ -341,6 +366,49 @@ def assemble_output_record(records: List[Dict[str, Any]],
         records, idxs, required_fields=SDR_FIELDS,
         preference=preference, preferred_source=preferred_source
     )
+    # --- depth default fallback: prefer non-default depth from the *other* source; if all default -> DROP cluster ---
+    if _is_default_depth(loc_rec.get("depth")):
+        alt_loc, alt_key = None, (10**9, 10**6)
+        for i in idxs:
+            r = records[i]
+            if normalize_source(r) == preferred_source:
+                continue
+            # must have usable lon/lat/depth and be non-default depth
+            if not all(_finite(r.get(k)) for k in ("longitude","latitude","depth")):
+                continue
+            if _is_default_depth(r.get("depth")):
+                continue
+            key = _rank_for_source_epoch(normalize_source(r), _record_epoch(r), preference)
+            if _prefer(key, alt_key):
+                alt_loc, alt_key = r, key
+        if alt_loc is not None:
+            loc_rec = alt_loc
+        else:
+            # All candidates are default-depth: keep the preferred location as-is.
+            pass
+
+    # --- mechanism default fallback: prefer non-default SDR from the *other* source; if all default -> DROP cluster ---
+    if sdr_rec is not None and _is_default_mech(sdr_rec):
+        alt_sdr, alt_key = None, (10**9, 10**6)
+        for i in idxs:
+            r = records[i]
+            if normalize_source(r) == preferred_source:
+                continue
+            # must have a complete SDR and be non-default mech
+            try:
+                ok_sdr = all(_finite(r.get(k)) for k in SDR_FIELDS)
+            except Exception:
+                ok_sdr = False
+            if not ok_sdr or _is_default_mech(r):
+                continue
+            key = _rank_for_source_epoch(normalize_source(r), _record_epoch(r), preference)
+            if _prefer(key, alt_key):
+                alt_sdr, alt_key = r, key
+        if alt_sdr is not None:
+            sdr_rec = alt_sdr
+        else:
+            # All candidates have default SDR: keep the preferred mechanism as-is.
+            pass
 
     out: Dict[str, Any] = {
         "id":        base_rec.get("id"),
@@ -421,7 +489,11 @@ def merge_and_label(input_files: Dict[str, str],
     records = all_df.to_dict("records")
     clusters = dedup_clusters(records, dt_near_s=dt_near_s, km_near=km_near, dmag_near=dmag_near)
 
-    merged_rows = [assemble_output_record(records, cl, preference=preference) for cl in clusters]
+    merged_rows: List[Dict[str, Any]] = []
+    for cl in clusters:
+        rec = assemble_output_record(records, cl, preference=preference)
+        if rec is not None:   # <-- skip clusters we decided to drop
+            merged_rows.append(rec)
     df_merged = pd.DataFrame(merged_rows)
 
     if not df_merged.empty:

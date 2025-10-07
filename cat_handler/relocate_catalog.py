@@ -13,6 +13,7 @@ from cat_handler import paths
 # ---------------- Config ----------------
 TIME_TOL_S: float = 60.0   # time matching window (seconds)
 MAG_TOL: float   = 0.8      # magnitude tolerance (different scales)
+DEFAULT_DEPTH = 33.0
 
 # ---------------- Schema ----------------
 FIELDS: List[str] = [
@@ -140,6 +141,7 @@ def relocate_with_potin(
     out_csv: str,
     time_tol_s: float = TIME_TOL_S,
     mag_tol: float = MAG_TOL,
+    default_depth: float = DEFAULT_DEPTH
 ) -> None:
     # Load
     merged = pd.read_csv(merged_csv)
@@ -167,6 +169,7 @@ def relocate_with_potin(
     merged_mags   = pd.to_numeric(merged["mag"], errors="coerce").to_numpy(dtype=float)
     merged_lons   = pd.to_numeric(merged["longitude"], errors="coerce").to_numpy(dtype=float)
     merged_lats   = pd.to_numeric(merged["latitude"],  errors="coerce").to_numpy(dtype=float)
+    merged_deps   = pd.to_numeric(merged["depth"],  errors="coerce").to_numpy(dtype=float)
 
     # Iterate and update where matched
     lon_new  = merged["longitude"].to_numpy(dtype=object)
@@ -189,6 +192,8 @@ def relocate_with_potin(
             time_tol_s=time_tol_s, mag_tol=mag_tol
         )
         if j is None:
+            if merged_deps[i] == 30.:
+                dep_err[i] = "default"
             continue
 
         # Update coordinates to relocated
@@ -220,6 +225,7 @@ def main() -> None:
         out_csv=str(paths.cat_relocated),
         time_tol_s=TIME_TOL_S,
         mag_tol=MAG_TOL,
+        default_depth=33,
     )
 
 if __name__ == "__main__":

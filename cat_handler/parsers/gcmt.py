@@ -11,7 +11,7 @@ import pandas as pd
 from cat_handler.parsers.tools import filter_df
 
 # -------------------- CONFIG --------------------
-LAT_MIN, LAT_MAX = -51.0, -27.0
+LAT_MIN, LAT_MAX = -51.0, -31.0
 LON_MIN, LON_MAX = -80.0, -65.0
 MAG_MIN = 4.95
 TIME_MIN = pd.to_datetime("1976-01-01T00:00:00", utc=True)

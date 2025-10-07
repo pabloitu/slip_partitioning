@@ -24,10 +24,10 @@ PREFERRED_DC_PLANE = 1  # 1 or 2
 
 # ---------------- Class labels & colors ----------------
 CLASS_COLORS: Dict[str, str] = {
-    "crustal_intraarc_shallow": "darkgreen",
-    "crustal_intraarc_deep":    "darkgreen",
+    "intraarc_shallow": "darkgreen",
+    "intraarc_deep":    "darkgreen",
     "slab_interface":           "deepskyblue",
-    "intra_slab":               "deepskyblue", #"deepskyblue",
+    "intra_slab":               "teal", #"deepskyblue",
     "outer_rise":               "burlywood",
     "forearc":                  "orange",
     "backarc":                  "mediumpurple",
@@ -188,7 +188,7 @@ def render_catalog(name: str, csv_path: Path, out_root: Path) -> None:
 
 def main() -> None:
     sources_to_render = [
-        "merged",
+        # "merged",
         "selected",
         "relocated",
         # "anss",

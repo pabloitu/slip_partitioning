@@ -12,13 +12,13 @@ FIELDS: List[str] = [
     "lon_error", "lat_error", "depth_error", "mag_error",
     "strike1", "dip1", "rake1", "strike2", "dip2", "rake2",
     "Mrr", "Mtt", "Mpp", "Mrt", "Mrp", "Mtp",
-    "source", "dups",
+    "source"
 ]
 
 # ---- default spatial/magnitude filter (same region you’ve been using elsewhere) ----
-LAT_MIN, LAT_MAX = -51.0, -27.0
+LAT_MIN, LAT_MAX = -51.0, -31.0
 LON_MIN, LON_MAX = -80.0, -65.0
-MAG_MIN = 4.95  # NaN magnitudes are KEPT
+MAG_MIN = 4.8  # NaN magnitudes are KEPT
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -121,8 +121,7 @@ def parse_potin(in_path: str,
             "strike1": np.nan, "dip1": np.nan, "rake1": np.nan,
             "strike2": np.nan, "dip2": np.nan, "rake2": np.nan,
             "Mrr": np.nan, "Mtt": np.nan, "Mpp": np.nan, "Mrt": np.nan, "Mrp": np.nan, "Mtp": np.nan,
-            "source": "potin",
-            "dups": "",
+            "source": "potin2025",
         })
 
     out = pd.DataFrame(rows)
