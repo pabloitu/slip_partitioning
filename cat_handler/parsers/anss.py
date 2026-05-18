@@ -59,32 +59,32 @@ FIELDS = [
 
 # -------------------- MANUAL ENTRIES (if product fetch fails) --------------------
 UNQUERYABLE_EARTHQUAKES: List[Dict[str, Any]] = [
-    dict(
-        id="choy19850303224726",
-        time_iso="1985-03-03T22:47:26",
-        longitude=-71.62,
-        latitude=-33.12,
-        depth=40.0,
-        mag=8.0,
-        mag_type="mw",
-        lon_error=None,
-        lat_error=None,
-        depth_error=None,
-        mag_error=None,
-        strike1=360.0,
-        dip1=35.0,
-        rake1=105.0,
-        strike2=360.0,
-        dip2=35.0,
-        rake2=105.0,
-        Mrr=None,
-        Mtt=None,
-        Mpp=None,
-        Mrt=None,
-        Mrp=None,
-        Mtp=None,
-        source="anss",
-    ),
+    # dict(
+    #     id="choy19850303224726",
+    #     time_iso="1985-03-03T22:47:26",
+    #     longitude=-71.62,
+    #     latitude=-33.12,
+    #     depth=40.0,
+    #     mag=8.0,
+    #     mag_type="mw",
+    #     lon_error=None,
+    #     lat_error=None,
+    #     depth_error=None,
+    #     mag_error=None,
+    #     strike1=360.0,
+    #     dip1=35.0,
+    #     rake1=105.0,
+    #     strike2=360.0,
+    #     dip2=35.0,
+    #     rake2=105.0,
+    #     Mrr=None,
+    #     Mtt=None,
+    #     Mpp=None,
+    #     Mrt=None,
+    #     Mrp=None,
+    #     Mtp=None,
+    #     source="anss",
+    # ),
     dict(
         id="official20100227063411530_30",
         time_iso="2010-02-27T06:34:11",
@@ -342,7 +342,12 @@ def build_csv_from_catalog(
     total = len(input_catalog)
 
     for i, row in input_catalog.iterrows():
+
         eid = str(row["id"])
+        if eid != 'usp0002ccz':
+            continue
+        else:
+            print('reading')
         print(f"[ANSS] parsing {i+1}/{total} id: {eid}")
         blob = get_quakeml_bytes(row)
         if not blob:

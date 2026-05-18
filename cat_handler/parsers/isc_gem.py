@@ -19,7 +19,7 @@ from cat_handler.parsers.tools import _sf, _has_sdr, _has_tensor, _finite, filte
 
 LAT_MIN, LAT_MAX = -57.0, -17.0
 LON_MIN, LON_MAX = -80.0, -65.0
-TIME_MIN_STR = "1976-01-01T00:00:00"
+TIME_MIN_STR = "1960-01-01T00:00:00"
 MAG_MIN = 4.95
 
 TIME_MIN = pd.to_datetime(TIME_MIN_STR, utc=True)

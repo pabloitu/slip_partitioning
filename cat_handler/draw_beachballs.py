@@ -189,7 +189,7 @@ def render_catalog(name: str, csv_path: Path, out_root: Path) -> None:
 def main() -> None:
     sources_to_render = [
         # "merged",
-        # "selected",
+        "selected",
         "relocated",
         # "anss",
         # "gcmt_perez",
